@@ -1,0 +1,3296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>枪林弹雨 V2 · 战役</title>
+<style>
+  html,body{margin:0;padding:0;background:#07100a;height:100%;overflow:hidden;
+    font-family:"Microsoft YaHei","PingFang SC",sans-serif;color:#cfd8c0;}
+  #wrap{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{image-rendering:pixelated;background:#07100a;
+    box-shadow:0 0 0 2px #243d1e,0 0 40px #000;max-width:100%;max-height:100%;}
+  #tip{position:absolute;bottom:6px;left:0;right:0;text-align:center;font-size:12px;color:#4d6b3c;
+    pointer-events:none;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv" width="960" height="540"></canvas></div>
+<div id="tip">A/D 移动  W 跳  S 蹲  鼠标瞄准  左键射击  R 换弹  长按 G 瞄准手雷/松开投掷  Q 丢枪  右键拾枪  空格 梯子/绳梯  ESC 暂停</div>
+<script>
+"use strict";
+
+/* ===================== 基础常量 ===================== */
+var VW = 960, VH = 540;
+var TILE = 20, COLS = 230, ROWS = 27;
+var WORLD_W = COLS * TILE, WORLD_H = ROWS * TILE;
+
+var cv = document.getElementById('cv');
+var ctx = cv.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+/* ===================== 基础调色板 ===================== */
+var BASE = {
+  sky1: '#0c1a12', sky2: '#1c3a22', hillFar: '#16361e', hillNear: '#1f4a28',
+  grass: '#5a8c30', dirt: '#33491f', dirtDark: '#223015',
+  steel: '#5a6068', steelDark: '#363b42', crate: '#8a5a26', crateDark: '#54340f',
+  green: '#7fb03a', greenD: '#2f5a1c', red: '#d2422c', gold: '#e0bd3e',
+  white: '#e7ecda', ink: '#0a1208', accent: '#46c8d8',
+  cloud: 'rgba(255,255,255,0.10)', star: 'rgba(255,255,255,0.8)'
+};
+var TH = Object.assign({}, BASE);   // 当前关卡主题（drawWorld 使用）
+
+/* ===================== 输入 ===================== */
+var keys = {}, just = {};
+var mouse = { x: VW / 2, y: VH / 2, down: false, click: false, rclick: false };
+
+window.addEventListener('keydown', function (e) {
+  if (!keys[e.code]) just[e.code] = true;
+  keys[e.code] = true;
+  if (e.code === 'KeyG' && state === 'play' && player && !player.dead) grenAiming = true;
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].indexOf(e.code) >= 0) e.preventDefault();
+});
+window.addEventListener('keyup', function (e) {
+  keys[e.code] = false;
+  if (e.code === 'KeyG' && grenAiming) { grenAiming = false; throwGren(); }
+});
+window.addEventListener('blur', function () { keys = {}; mouse.down = false; grenAiming = false; });
+
+cv.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+cv.addEventListener('mousemove', function (e) {
+  var r = cv.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) * (VW / r.width);
+  mouse.y = (e.clientY - r.top) * (VH / r.height);
+});
+cv.addEventListener('mousedown', function (e) {
+  var r = cv.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) * (VW / r.width);
+  mouse.y = (e.clientY - r.top) * (VH / r.height);
+  if (e.button === 2) { mouse.rclick = true; e.preventDefault(); }
+  else { mouse.down = true; mouse.click = true; }
+});
+window.addEventListener('mouseup', function (e) { if (e.button === 2) mouse.rclick = false; else mouse.down = false; });
+
+/* ===================== 音效 ===================== */
+var AC = null;
+function actx() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = false; } }
+  return AC;
+}
+function beep(freq, dur, type, vol) {
+  var a = actx(); if (!a) return;
+  try {
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || 'square'; o.frequency.value = freq;
+    g.gain.value = vol || 0.04;
+    o.connect(g); g.connect(a.destination);
+    g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
+    o.start(); o.stop(a.currentTime + dur);
+  } catch (e) {}
+}
+function boom() {
+  var a = actx(); if (!a) return;
+  try {
+    var len = Math.floor(a.sampleRate * 0.4);
+    var buf = a.createBuffer(1, len, a.sampleRate);
+    var d = buf.getChannelData(0);
+    for (var i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.2);
+    var s = a.createBufferSource(); s.buffer = buf;
+    var g = a.createGain(); g.gain.value = 0.22;
+    s.connect(g); g.connect(a.destination); s.start();
+  } catch (e) {}
+}
+var SFX = {
+  shot: function () { beep(220 + Math.random() * 60, 0.07, 'square', 0.035); },
+  mg: function () { beep(160 + Math.random() * 40, 0.04, 'sawtooth', 0.022); },
+  sg: function () { beep(110, 0.14, 'sawtooth', 0.06); },
+  rl: function () { beep(90, 0.1, 'square', 0.05); },
+  hurt: function () { beep(150, 0.12, 'triangle', 0.07); },
+  reload: function () { beep(320, 0.05, 'square', 0.04); setTimeout(function () { beep(200, 0.06, 'square', 0.04); }, 180); },
+  die: function () { beep(120, 0.3, 'sawtooth', 0.06); },
+  pick: function () { beep(520, 0.07, 'square', 0.04); },
+  toss: function () { beep(400, 0.08, 'sine', 0.04); },
+  setpt: function () { beep(660, 0.09, 'square', 0.05); setTimeout(function () { beep(880, 0.12, 'square', 0.05); }, 110); },
+  crate: function () { beep(150, 0.05, 'square', 0.025); setTimeout(function () { beep(90, 0.05, 'square', 0.018); }, 28); },
+  armor: function () { beep(900, 0.05, 'square', 0.05); },
+  knife: function () { beep(320 + Math.random() * 90, 0.05, 'sawtooth', 0.03); },
+  win: function () { beep(440, 0.12, 'square', 0.05); setTimeout(function () { beep(660, 0.12, 'square', 0.05); }, 140); setTimeout(function () { beep(880, 0.22, 'square', 0.05); }, 280); }
+};
+
+/* ===================== 武器定义 ===================== */
+// dmg 为「敌方最大血量的百分比」
+var WEAPONS = {
+  pistol:  { key:'pistol',  name:'手枪',   kind:'pistol',  mag:10,  rate:280,  dmg:10, pellets:1, spread:0.025, range:520, speed:11, auto:false, reload:900 },
+  shotgun: { key:'shotgun', name:'霰弹枪', kind:'primary', mag:10,  rate:780,  dmg:10, pellets:5, spread:0.20,  range:280, speed:9,  auto:false, reload:1200 },
+  mg:      { key:'mg',      name:'机枪',   kind:'primary', mag:125, rate:67,   dmg:20, pellets:1, spread:0.085, range:640, speed:13, auto:true,  reload:2000 },
+  rocket:  { key:'rocket',  name:'火箭炮', kind:'primary', mag:1,   rate:1200, dmg:100,pellets:1, spread:0.01,  range:700, speed:7,  auto:false, reload:2200, explosive:true, autoReload:true, pierce:1 },
+  urocket: { key:'urocket', name:'超级火箭炮', kind:'primary', mag:10,  rate:1500, dmg:100,pellets:1, spread:0.01,  range:700, speed:7,  auto:false, reload:2200, explosive:true, autoReload:true, pierce:1, volley:5 },
+  bounce:   { key:'bounce',  name:'反弹枪', kind:'primary', mag:100, rate:180,  dmg:10, pellets:1, spread:0.03,  range:560, speed:12, auto:true,  reload:1500, bounce:10, splash:5 },
+  knife:    { key:'knife',   name:'刀',     kind:'melee',  mag:0,   rate:1000, dmg:0,  pellets:1, spread:0,      range:34,  speed:0,  auto:true,  reload:0 }
+};
+
+/* ===================== 敌人兵种 ===================== */
+var ETYPES = [
+  { name:'手枪兵',   hp:100, rate:1250, dmg:[5,10],  range:300, speed:1.0, bspeed:8,  col:'#c9a23a', helm:'#7a5e12', w:'pistol',  drop:'pistol'  },
+  { name:'霰弹枪兵', hp:120, rate:1950, dmg:[8,20],  range:220, speed:0.9, bspeed:7,  col:'#c2622a', helm:'#6a3310', w:'shotgun', drop:'shotgun', pellets:3 },
+  { name:'机枪兵',   hp:150, rate:130,  dmg:[5,8],   range:430, speed:0.6, bspeed:9,  col:'#3f8f4a', helm:'#20541f', w:'mg',      drop:'mg'      },
+  { name:'火箭炮兵', hp:130, rate:3300, dmg:[40,90], range:520, speed:0.5, bspeed:5,  col:'#c8502e', helm:'#6a2713', w:'rocket',  drop:'rocket', explosive:true },
+  { name:'狙击兵',   hp:90,  rate:2700, dmg:[25,60], range:700, speed:0.4, bspeed:16, col:'#3a7fb0', helm:'#1c3f54', w:'pistol',  drop:'pistol'  },
+  { name:'突击兵',   hp:110, rate:430,  dmg:[6,15],  range:360, speed:1.5, bspeed:10, col:'#9a4fb0', helm:'#4a2354', w:'mg',      drop:'mg'      },
+  { name:'抢旗手',   hp:120, rate:1600, dmg:[8,16],  range:300, speed:2.2, bspeed:9,  col:'#d04ad0', helm:'#5a1a5a', w:'mg',      drop:'mg',      stealer:true }
+];
+
+/* ===================== 难度 ===================== */
+// 简单=正常；困难=攻击-10%、敌方更快更敏锐；地狱=伤害-50%、敌方察觉范围50米
+var DIFFS = [
+  { key:'easy', name:'简单', dmgMul:1.0, espeed:1.0, detectM:0,  hearMul:1.0, alertT:6000, lenMul:1.0, eMul:1.0, dropMul:1.0, note:'最正常的体验' },
+  { key:'hard', name:'困难', dmgMul:0.9, espeed:1.2, detectM:25, hearMul:1.4, alertT:6000, lenMul:1.2, eMul:1.3, dropMul:1.4, note:'攻击-10%，敌方更快更敏锐，地图更长、敌人更多，掉落更丰厚' },
+  { key:'hell', name:'地狱', dmgMul:0.5, espeed:1.3, detectM:50, hearMul:1.7, alertT:6000, lenMul:1.5, eMul:1.5, dropMul:1.8, note:'伤害-50%，察觉范围50米，地图最长、敌人最多，掉落最丰厚，且出现抢旗手' }
+];
+var DIFFKEY = 0;                 // 0=简单 1=困难 2=地狱
+var DIFF = DIFFS[DIFFKEY];
+
+/* ===================== 关卡配置（多关，地图互不相同） ===================== */
+var LEVELS = [
+  { name:'晨雾平原', theme:{ sky1:'#16263a', sky2:'#3a5a6e', hillFar:'#2c4a5a', hillNear:'#3c6470', grass:'#6fae52', dirt:'#3c5230', dirtDark:'#27381f', steel:'#6a7078', steelDark:'#3c424a', accent:'#5fd0e0', cloud:'rgba(220,235,255,0.16)' },
+    ground:[1.1,0.045,0.7,0.13,22,19,24], plat:[[38,16,9],[84,15,10],[128,17,9],[176,14,10]], lad:[[42,16,24],[88,15,24],[132,17,24],[180,14,24]],
+    crates:[12,13,26,27,55,56,95,96,140,141,190,191], enemies:{count:10,types:[0]}, rf:100, goalC:219 },
+
+  { name:'废弃工厂', theme:{ sky1:'#222028', sky2:'#3a3640', hillFar:'#2a2730', hillNear:'#3a3642', grass:'#5a6a3a', dirt:'#2c2e26', dirtDark:'#1c1e18', steel:'#7a8088', steelDark:'#454a52', accent:'#e0a83e', cloud:'rgba(200,200,210,0.08)' },
+    ground:[0.5,0.03,0.4,0.10,23,21,24], plat:[[30,18,7],[58,15,8],[92,17,7],[120,13,9],[150,16,8],[184,12,10],[206,16,8]], lad:[[33,18,24],[61,15,24],[95,17,24],[123,13,24],[153,16,24],[187,12,24]],
+    crates:[20,21,44,45,70,71,110,111,135,136,165,166,200,201], enemies:{count:12,types:[0,1]}, rf:108, goalC:219 },
+
+  { name:'峡谷裂谷', theme:{ sky1:'#3a2a18', sky2:'#7a4a22', hillFar:'#5a3a1e', hillNear:'#7a5026', grass:'#9a8a3a', dirt:'#5a3a1e', dirtDark:'#3a2412', steel:'#6a5440', steelDark:'#3c2c1e', accent:'#f0c040', cloud:'rgba(255,220,160,0.10)' },
+    ground:[2.0,0.05,1.1,0.16,21,17,24], plat:[[34,15,8],[70,12,9],[104,16,8],[140,11,10],[176,15,9],[200,13,8]], lad:[[38,15,24],[74,12,24],[108,16,24],[144,11,24],[180,15,24]],
+    crates:[16,17,48,49,90,91,128,129,160,161,196,197], enemies:{count:14,types:[0,1,2]}, rf:96, goalC:219 },
+
+  { name:'丛林哨站', theme:{ sky1:'#0e241a', sky2:'#1f5236', hillFar:'#163a26', hillNear:'#1f5236', grass:'#3fae4a', dirt:'#2c4a22', dirtDark:'#1a3016', steel:'#4a6a3a', steelDark:'#2c4220', accent:'#9ee04a', cloud:'rgba(200,255,210,0.10)' },
+    ground:[1.4,0.04,0.9,0.15,22,19,24], plat:[[40,16,9],[86,14,10],[132,17,9],[172,13,10],[202,16,8]], lad:[[44,16,24],[90,14,24],[136,17,24],[176,13,24]],
+    crates:[12,13,30,31,58,59,98,99,120,121,156,157,188,189], enemies:{count:16,types:[1,2,5]}, rf:112, goalC:219 },
+
+  { name:'雪原前哨', theme:{ sky1:'#9fb6c8', sky2:'#d6e6f0', hillFar:'#b8c8d4', hillNear:'#d0dce6', grass:'#eef4f8', dirt:'#9aa6b0', dirtDark:'#6a7680', steel:'#8a96a0', steelDark:'#5a646e', accent:'#5ab0e0', cloud:'rgba(255,255,255,0.30)' },
+    ground:[1.2,0.035,0.8,0.12,22,20,24], plat:[[36,16,8],[80,14,9],[124,16,8],[168,13,10],[200,15,8]], lad:[[40,16,24],[84,14,24],[128,16,24],[172,13,24]],
+    crates:[18,19,52,53,92,93,134,135,170,171,198,199], enemies:{count:17,types:[0,2,4]}, rf:104, goalC:219 },
+
+  { name:'沙漠废墟', theme:{ sky1:'#caa24a', sky2:'#e6c46a', hillFar:'#c79a3e', hillNear:'#d8b052', grass:'#d8c46a', dirt:'#a07a2e', dirtDark:'#6a4d18', steel:'#9a8a5a', steelDark:'#6a5c34', accent:'#e06a2a', cloud:'rgba(255,240,200,0.18)' },
+    ground:[1.6,0.045,0.7,0.14,22,19,24], plat:[[34,15,9],[72,17,8],[110,13,10],[148,16,9],[186,12,10],[208,16,8]], lad:[[38,15,24],[76,17,24],[114,13,24],[152,16,24],[190,12,24]],
+    crates:[14,15,44,45,84,85,126,127,162,163,194,195], enemies:{count:19,types:[1,2,3,5]}, rf:100, goalC:219 },
+
+  { name:'夜袭基地', theme:{ sky1:'#0a0a1c', sky2:'#1c1c3a', hillFar:'#14142a', hillNear:'#222244', grass:'#3a3a6a', dirt:'#1a1a2e', dirtDark:'#0e0e1c', steel:'#3a3a52', steelDark:'#22223a', accent:'#b05ae0', cloud:'rgba(160,160,255,0.10)', stars:true },
+    ground:[0.9,0.04,0.6,0.13,22,19,24], plat:[[32,16,9],[76,14,10],[120,16,9],[160,12,10],[198,15,9]], lad:[[36,16,24],[80,14,24],[124,16,24],[164,12,24],[202,15,24]],
+    crates:[16,17,50,51,88,89,128,129,164,165,196,197], enemies:{count:21,types:[0,2,3,4,5]}, rf:108, goalC:219 },
+
+  { name:'火山地带', theme:{ sky1:'#2a0e08', sky2:'#6a1e0e', hillFar:'#4a1408', hillNear:'#6a1e0e', grass:'#c8502a', dirt:'#4a160c', dirtDark:'#2a0c06', steel:'#7a4a3a', steelDark:'#4a2a1e', accent:'#f0782a', cloud:'rgba(255,120,60,0.12)' },
+    ground:[1.8,0.05,1.0,0.15,21,18,24], plat:[[38,15,8],[82,17,9],[124,13,10],[162,16,8],[200,12,10]], lad:[[42,15,24],[86,17,24],[128,13,24],[166,16,24],[204,12,24]],
+    crates:[20,21,56,57,96,97,136,137,170,171,200,201], enemies:{count:23,types:[1,2,3,4,5]}, rf:96, goalC:219 },
+
+  { name:'都市天台', theme:{ sky1:'#1a2230', sky2:'#3a4a5e', hillFar:'#28323e', hillNear:'#3a4654', grass:'#4a6a4a', dirt:'#2c323c', dirtDark:'#1a1e26', steel:'#8a9098', steelDark:'#545a62', accent:'#5ad0a0', cloud:'rgba(200,220,240,0.12)' },
+    ground:[0.3,0.02,0.3,0.08,24,23,25], plat:[[28,20,8],[52,17,9],[78,20,8],[104,14,10],[130,18,9],[156,11,10],[182,16,8],[204,13,9]], lad:[[31,20,24],[55,17,24],[107,14,24],[159,11,24],[207,13,24]],
+    crates:[24,25,60,61,100,101,140,141,176,177,198,199], enemies:{count:25,types:[0,1,2,3,4,5]}, rf:112, goalC:219 },
+
+  { name:'终极要塞', theme:{ sky1:'#1c1018', sky2:'#3a1c2a', hillFar:'#2a1622', hillNear:'#3a2030', grass:'#7a3a4a', dirt:'#3a2230', dirtDark:'#22121c', steel:'#7a6070', steelDark:'#46344a', accent:'#e0407a', cloud:'rgba(255,200,220,0.10)' },
+    ground:[1.0,0.04,0.7,0.13,22,19,24], plat:[[30,17,8],[58,14,9],[90,18,8],[122,12,10],[152,16,9],[182,11,10],[206,15,8]], lad:[[34,17,24],[62,14,24],[94,18,24],[126,12,24],[156,16,24],[186,11,24]],
+    crates:[16,17,46,47,86,87,128,129,166,167,198,199,210,211], enemies:{count:30,types:[0,1,2,3,4,5]}, rf:104, goalC:219 },
+
+  { name:'黄昏港口', theme:{ sky1:'#2a1830', sky2:'#6a3a4a', hillFar:'#3a2438', hillNear:'#4a2e44', grass:'#7a5a3a', dirt:'#3a2a28', dirtDark:'#241a18', steel:'#6a5a5a', steelDark:'#3a323a', accent:'#f0a040', cloud:'rgba(255,200,160,0.10)' },
+    ground:[1.0,0.04,0.7,0.13,22,19,24], plat:[[30,17,8],[66,14,9],[104,17,8],[140,12,10],[178,16,9],[208,13,8]], lad:[[34,17,24],[70,14,24],[108,17,24],[144,12,24],[182,16,24],[211,13,24]],
+    crates:[16,17,48,49,90,91,132,133,168,169,200,201], enemies:{count:32,types:[0,1,2,3,4,5]}, rf:104, goalC:219 },
+
+  { name:'冰封峡谷', theme:{ sky1:'#0e2a3a', sky2:'#3a6a8a', hillFar:'#1c4458', hillNear:'#2a5a72', grass:'#bfe0ea', dirt:'#5a7a86', dirtDark:'#34525c', steel:'#8aa0aa', steelDark:'#566a72', accent:'#7ad0f0', cloud:'rgba(255,255,255,0.25)' },
+    ground:[1.3,0.045,0.8,0.14,22,19,24], plat:[[32,16,9],[70,18,8],[108,13,10],[146,16,9],[184,12,10],[206,15,8]], lad:[[36,16,24],[74,18,24],[112,13,24],[150,16,24],[188,12,24],[209,15,24]],
+    crates:[18,19,52,53,94,95,136,137,172,173,202,203], enemies:{count:34,types:[0,1,2,3,4,5]}, rf:100, goalC:219 },
+
+  { name:'沙漠绿洲', theme:{ sky1:'#caa24a', sky2:'#ecc87a', hillFar:'#c79a3e', hillNear:'#d8b052', grass:'#9ac84a', dirt:'#a07a2e', dirtDark:'#6a4d18', steel:'#9a8a5a', steelDark:'#6a5c34', accent:'#e07a2a', cloud:'rgba(255,240,200,0.18)' },
+    ground:[1.5,0.04,0.7,0.14,22,19,24], plat:[[34,15,9],[72,17,8],[110,13,10],[148,16,9],[186,12,10],[208,16,8]], lad:[[38,15,24],[76,17,24],[114,13,24],[152,16,24],[190,12,24]],
+    crates:[14,15,44,45,84,85,126,127,162,163,194,195], enemies:{count:36,types:[0,1,2,3,4,5]}, rf:96, goalC:219 },
+
+  { name:'雨林遗迹', theme:{ sky1:'#0e2e1a', sky2:'#1f5a36', hillFar:'#163e26', hillNear:'#1f5236', grass:'#3fae4a', dirt:'#2c4a30', dirtDark:'#1a301c', steel:'#4a6a4a', steelDark:'#2c4230', accent:'#9ee07a', cloud:'rgba(200,255,210,0.10)' },
+    ground:[1.4,0.04,0.9,0.15,22,19,24], plat:[[36,16,9],[84,14,10],[130,17,9],[170,13,10],[202,16,8]], lad:[[40,16,24],[88,14,24],[134,17,24],[174,13,24]],
+    crates:[12,13,40,41,78,79,116,117,154,155,190,191], enemies:{count:38,types:[0,1,2,3,4,5]}, rf:112, goalC:219 },
+
+  { name:'钢铁都市', theme:{ sky1:'#1a2230', sky2:'#3a4a5e', hillFar:'#28323e', hillNear:'#3a4654', grass:'#4a6a6a', dirt:'#2c323c', dirtDark:'#1a1e26', steel:'#8a9098', steelDark:'#545a62', accent:'#5ad0c0', cloud:'rgba(200,220,240,0.12)' },
+    ground:[0.4,0.02,0.4,0.09,24,23,25], plat:[[28,20,8],[52,17,9],[78,20,8],[104,14,10],[130,18,9],[156,11,10],[182,16,8],[204,13,9]], lad:[[31,20,24],[55,17,24],[107,14,24],[159,11,24],[207,13,24]],
+    crates:[24,25,60,61,100,101,140,141,176,177,200,201], enemies:{count:40,types:[0,1,2,3,4,5]}, rf:108, goalC:219 },
+
+  { name:'月球基地', theme:{ sky1:'#05060f', sky2:'#101428', hillFar:'#0a0e1c', hillNear:'#14182e', grass:'#6a6a8a', dirt:'#2a2a3a', dirtDark:'#16161f', steel:'#5a5a72', steelDark:'#34344a', accent:'#b0b0e0', cloud:'rgba(255,255,255,0.05)', stars:true },
+    ground:[0.8,0.035,0.6,0.12,22,20,24], plat:[[34,16,8],[80,14,9],[124,16,8],[168,13,10],[200,15,8]], lad:[[38,16,24],[84,14,24],[128,16,24],[172,13,24]],
+    crates:[16,17,50,51,92,93,134,135,170,171,198,199], enemies:{count:42,types:[0,1,2,3,4,5]}, rf:104, goalC:219 },
+
+  { name:'熔岩洞窟', theme:{ sky1:'#2a0e08', sky2:'#7a2e0e', hillFar:'#4a1808', hillNear:'#6a220e', grass:'#c8502a', dirt:'#4a1a0c', dirtDark:'#2a0c06', steel:'#7a4a3a', steelDark:'#4a2a1e', accent:'#f0902a', cloud:'rgba(255,120,60,0.12)' },
+    ground:[1.7,0.05,1.0,0.15,21,18,24], plat:[[38,15,8],[82,17,9],[124,13,10],[162,16,8],[200,12,10]], lad:[[42,15,24],[86,17,24],[128,13,24],[166,16,24],[204,12,24]],
+    crates:[20,21,56,57,96,97,136,137,170,171,200,201], enemies:{count:44,types:[0,1,2,3,4,5]}, rf:96, goalC:219 },
+
+  { name:'终焉堡垒', theme:{ sky1:'#160810', sky2:'#3a1024', hillFar:'#240e1a', hillNear:'#341424', grass:'#8a3a4a', dirt:'#341824', dirtDark:'#1e0e16', steel:'#7a6070', steelDark:'#46344a', accent:'#e0407a', cloud:'rgba(255,200,220,0.10)' },
+    ground:[1.0,0.04,0.7,0.13,22,19,24], plat:[[30,17,8],[58,14,9],[90,18,8],[122,12,10],[152,16,9],[182,11,10],[206,15,8]], lad:[[34,17,24],[62,14,24],[94,18,24],[126,12,24],[156,16,24],[186,11,24]],
+    crates:[16,17,46,47,86,87,128,129,166,167,198,199,210,211], enemies:{count:50,types:[0,1,2,3,4,5]}, rf:104, goalC:219 }
+];
+
+/* ===================== 世界状态 ===================== */
+var tiles = null;
+var hm = null;
+var ladders = [];
+var flag = null, rope = null, plane = null;
+var redFlags = [];        // 战役模式：固定位置的敌方红旗（可夺为复活点）
+var extractFlag = null;    // 撤离点进攻红旗：常驻于撤离点，每 10 秒召唤随机敌兵（不含抢旗手）
+var respawnFlag = null;   // 当前已夺取的复活点（指向 redFlags 中某一项）
+var STEAL_TIME = 10000;
+var spawn = { x: 90, y: 0 };
+var redFlag = { x: 0, y: 0, active: false };   // 复活点红色旗：玩家离开时每秒召唤随机兵种
+var redSpawnT = 0;
+var RED_FLAG_R = 80;                            // 玩家“在旗点”判定半径
+var GRENADE_RAD = 3;                             // 手雷爆炸半径（格）—— 已增大
+var RED_FLAG_DX = 125;                           // 红旗距复活点 12.5m（10~15m 区间）
+var MAX_HEALTHPACKS = 10;
+var GREN_CAP = 10;                       // 手雷库存上限（战役模式）
+var RESPAWN_COST = 5;                    // 复活花费金币（金币不足则直接阵亡/游戏结束）
+var BAR_PISTOL = 0, BAR_PRIM1 = 1, BAR_PRIM2 = 2;   // 武器栏槽位：0=手枪位，1/2=主武器位
+var MAX_BAR = 3;                        // 武器栏固定 3 槽（始终可用，1/2/3 切换）
+// 变卖物：1~6 级，卖出价值（金币）
+var SELLABLES = [
+  { lv:1, val:10 }, { lv:2, val:50 }, { lv:3, val:70 },
+  { lv:4, val:80 }, { lv:5, val:90 }, { lv:6, val:120 }
+];
+// 背包升级花费：每升一级 +20 金；背包等级 = 储物枪数（0 级=无背包，仅武器栏 3 槽）
+var BAG_COST = { 1:10, 2:30, 3:50, 4:70, 5:90, 6:110 };
+var SHOP_PRICES = { pistol: 5, shotgun: 7, mg: 10, rocket: 25, ammo: 2, health: 5, grenade: 5 };
+// 护甲：每级可抵挡子弹数 ×2，价格也 ×2；一级 5 发 / 10 金
+var ARMOR_DEFS = {
+  1: { name: '一级护甲', blocks: 5, price: 10 },
+  2: { name: '二级护甲', blocks: 10, price: 20 },
+  3: { name: '三级护甲', blocks: 20, price: 40 }
+};
+var BULLET_COST = SHOP_PRICES.ammo / 50;   // 每发子弹价值（50发=2金→单发0.04金），打掉即计入战损
+// 房卡购买价（仅战役商城；1~6 级，等级越高越贵）
+var CARD_PRICES = { 1: 8, 2: 14, 3: 22, 4: 32, 5: 45, 6: 60 };
+var CARD_DURA = 5;        // 每张房卡自带耐久：可开 N 次同级门，耗尽作废
+var CARD_PACK_CAP = 9;    // 卡包容量（同时携带的房卡总数上限）
+// 收集物（六色战利品，每色对应一个实物）：白/绿/蓝/紫/金/红；红最高 1 万、白最低 50，中间价自分化（约几何递增）
+var ITEM_VALS = [0, 50, 250, 800, 2500, 5500, 10000];   // 索引=等级 1..6（与卡牌同色阶）
+var TIER_NAMES = ['', '白', '绿', '蓝', '紫', '金', '红'];
+function itemVal(t) { return ITEM_VALS[Math.max(1, Math.min(6, t))] || 0; }
+// 全局平衡微调
+var ENEMY_SPEED_MUL = 0.8;     // 敌人移动速度 -20%
+var ITEM_DROP_MUL = 1.5;       // 收集物爆率 +50%（上轮需求）
+var ITEM_CAP = 12;              // 收集物（六色实物）独立容量：始终可拾取，不占用枪械背包格子（修复「死亡后背包清空导致收集物无法拾取」）
+var ENEMY_DMG_MUL = 0.5;       // 敌方造成的伤害 -50%
+var ENEMY_COUNT_MUL = 0.1;     // 关卡初始敌人数量 -90%
+// 复活币：商城 2 金/个，最多带 2 个；死亡时优先于金币复活消耗
+var REVIVE_COIN_PRICE = 2, REVIVE_COIN_MAX = 2;
+// 胸挂：装备后才能携带/使用血包（商城一次性购买，永久保留）
+var RIG_PRICE = 15;
+// 词条书（紫=4/金=5/红=6 三档）：给枪械加词条变强；红最强、紫最弱
+var BOOK_PRICES = { 4: 30, 5: 60, 6: 120 };
+var BOOK_AFFIX = { 4: { dmg: 0.15, rate: 0.10 }, 5: { dmg: 0.30, rate: 0.20 }, 6: { dmg: 0.50, rate: 0.35 } };
+var BOOK_TIERS = [4, 5, 6];
+// 子弹等级：一级（默认，当前伤害）/ 二级（+50% 伤害）；在商城「弹药」区右键升级
+var BULLET_L2_MUL = 1.5;          // 二级子弹伤害 = 一级 × 1.5（即比当前伤害高 50%）
+var BULLET_UPGRADE_COST = 4;      // 升级到二级花费（高于普通弹药 2 金）
+var BULLET_UPGRADE_AMMO = 60;     // 升级时附赠备弹（60 颗）
+function itemCol(t) { return cardCol(t); }
+// 收集物（六色战利品）：每一色对应一个实物，图案本身是该物件造型，轮廓染该色光芒；红最贵、白最便宜
+var ITEM_DEFS = {
+  1: { name: '电池', glow: '#ededed' },
+  2: { name: '能量饮料', glow: '#5fd070' },
+  3: { name: '蓝宝石', glow: '#5f9fe8' },
+  4: { name: '紫水晶', glow: '#b060e0' },
+  5: { name: '咖啡', glow: '#ffcf3f' },
+  6: { name: '钻石', glow: '#ff5040' }
+};
+function drawLootObj(t, cx, cy) {
+  if (t === 1) {                       // 电池
+    rr(cx - 2, cy - 7, 4, 3, '#9aa0a6'); rr(cx - 5, cy - 4, 10, 10, '#2c2c30');
+    rr(cx - 5, cy - 4, 10, 2, '#46464c'); rr(cx - 3, cy - 1, 6, 2, '#e8e8e8'); rr(cx - 3, cy + 2, 6, 2, '#e8e8e8');
+  } else if (t === 2) {                // 能量饮料
+    rr(cx - 4, cy - 6, 8, 13, '#2f7d32'); rr(cx - 4, cy - 6, 8, 2, '#cfd2d4'); rr(cx - 4, cy - 1, 8, 3, '#e8f5e9');
+  } else if (t === 3 || t === 4) {     // 宝石（蓝/紫）
+    var gc = (t === 3) ? '#3f7fd8' : '#9b4fd0';
+    ctx.fillStyle = gc; ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx, cy - 6); ctx.lineTo(cx + 6, cy - 2); ctx.lineTo(cx + 4, cy + 6); ctx.lineTo(cx - 4, cy + 6); ctx.lineTo(cx - 6, cy - 2); ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.beginPath(); ctx.moveTo(cx, cy - 6); ctx.lineTo(cx, cy + 6); ctx.stroke();
+  } else if (t === 5) {                // 咖啡
+    rr(cx - 5, cy - 3, 9, 9, '#f3ece0'); rr(cx - 5, cy - 3, 9, 2, '#caa37a');
+    ctx.strokeStyle = '#f3ece0'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(cx + 6, cy + 1, 3, -1.2, 1.2); ctx.stroke();
+    rr(cx - 3, cy - 7, 1, 3, '#fff'); rr(cx + 1, cy - 7, 1, 3, '#fff');
+  } else {                             // 钻石（红，最贵）
+    ctx.fillStyle = '#dff3ff'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx, cy - 6); ctx.lineTo(cx + 6, cy - 2); ctx.lineTo(cx, cy + 7); ctx.lineTo(cx - 6, cy - 2); ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.beginPath(); ctx.moveTo(cx - 6, cy - 2); ctx.lineTo(cx + 6, cy - 2); ctx.stroke();
+  }
+}
+function drawLootIcon(t, cx, cy) {
+  var col = (ITEM_DEFS[t] && ITEM_DEFS[t].glow) || itemCol(t);
+  ctx.save(); ctx.shadowColor = col; ctx.shadowBlur = 8; drawLootObj(t, cx, cy); ctx.restore();   // 图案整体染该色光芒
+  ctx.save(); ctx.shadowColor = col; ctx.shadowBlur = 5; ctx.strokeStyle = col; ctx.lineWidth = 1.3;
+  ctx.beginPath(); ctx.arc(cx, cy, 9, 0, Math.PI * 2); ctx.stroke(); ctx.restore();               // 轮廓细边发光
+}
+function gunVal(gk) { if (gk === 'knife') return 0; return SHOP_PRICES[gk] || (gk === 'urocket' ? 200 : 40); }
+// 仓库：跨关保留，仅存武器 + 变卖物（房卡不存）
+var warehouse = { guns: [], sell: { 1:0, 2:0, 3:0, 4:0, 5:0, 6:0 } };
+var keyHouses = [];                     // 战役模式：房卡房门
+var houseCrates = {};                    // 房卡房内木箱 → 其房卡等级（0/不存在=野外箱）
+var worldBtns = [];                     // 世界内可点击交互（如房卡房门）
+var bagBtns = [];                       // 背包界面按钮
+var bagAffixTarget = null;              // 背包内「附魔」选中的枪（点击后用对应档词条书强化）
+var whBtns = [];                        // 仓库界面按钮
+var deadBtns = [];                      // 阵亡菜单按钮
+var deathBoxes = [];                    // 死亡木盒（敌人可抢走）
+var bagLevelBonus = 0;                  // 每通关一关 +1 免费背包等级
+var playerLevel = 1;                    // 玩家等级（每通关一关 +1），用于门控背包购买
+function sellVal(lv) { for (var i = 0; i < SELLABLES.length; i++) if (SELLABLES[i].lv === lv) return SELLABLES[i].val; return 0; }
+function cardCol(lv) { return ['#ededed','#5fd070','#5f9fe8','#b060e0','#ffcf3f','#ff5040'][Math.max(0, Math.min(5, lv - 1))]; } // 白/绿/蓝/紫/金/红（K1~K6）
+function gunKind(gk) { var w = WEAPONS[gk]; return w ? w.kind : 'primary'; }
+// 词条书加成的有效武器数值（按武器类型累计，红最强/紫最弱；仅影响伤害与射速）
+function gunAffixOf(k) { return (player && player.gunAffix && player.gunAffix[k]) ? player.gunAffix[k] : null; }
+function gDmg(k) {
+  var a = gunAffixOf(k);
+  var base = WEAPONS[k].dmg * (a ? (1 + a.dmg) : 1);
+  var bt = (player && player.bulletTier && player.bulletTier[k] === 2) ? BULLET_L2_MUL : 1;
+  return base * bt;
+}
+function gRate(k) { var a = gunAffixOf(k); return WEAPONS[k].rate / (a ? (1 + a.rate) : 1); }
+function barSlotType(i) { return i === BAR_PISTOL ? 'pistol' : 'primary'; }
+function bagCap() { return player ? (player.bagLv || 0) : 0; }          // 背包储物容量 = 背包等级
+function bagRoom() { if (!player) return 0; return Math.max(0, bagCap() - player.bag.length - (player.items ? player.items.length : 0)); }  // 背包剩余空格（枪与物资共享）
+function ownsGun(gk) { if (!player) return false; return player.bar.indexOf(gk) >= 0 || player.bag.indexOf(gk) >= 0; }
+function freeBarSlot(kind) { if (!player) return -1; for (var i = 0; i < player.bar.length; i++) { if (barSlotType(i) === kind && !player.bar[i]) return i; } return -1; }
+function canCarry(gk) { var k = gunKind(gk); if (freeBarSlot(k) >= 0) return true; if (bagRoom() > 0) return true; return false; }
+function pickActiveWp() { if (!player) return; for (var i = 0; i < player.bar.length; i++) { if (player.bar[i]) { player.wp = player.bar[i]; player.noGun = false; return; } } player.wp = 'knife'; player.noGun = false; }   // 无枪时自动持刀（近战）
+function ownedGuns() { if (!player) return []; var a = player.bar.concat(player.bag); return a.filter(function (x) { return x; }); }
+function barFilled() { if (!player) return 0; var n = 0; for (var i = 0; i < player.bar.length; i++) if (player.bar[i]) n++; return n; }
+// 房卡：player.cards[lv] / player.cardPack[lv] 均为「耐久数组」（每个元素是一张卡的剩余耐久）
+function cardTotal() { if (!player) return 0; var n = 0; for (var l = 1; l <= 6; l++) n += (player.cards[l] ? player.cards[l].length : 0); return n; }
+function cardPackTotal() { if (!player) return 0; var n = 0; for (var l = 1; l <= 6; l++) n += (player.cardPack[l] ? player.cardPack[l].length : 0); return n; }
+function loadCardToPack(lv) {
+  if (!player || !player.cards[lv] || player.cards[lv].length === 0) return;
+  if (cardPackTotal() >= CARD_PACK_CAP) { bannerText = '卡包已满（' + CARD_PACK_CAP + '）'; bannerT = 1400; return; }
+  player.cardPack[lv].push(player.cards[lv].pop()); SFX.pick();
+}
+function unloadCardFromPack(lv) {
+  if (!player || !player.cardPack[lv] || player.cardPack[lv].length === 0) return;
+  player.cards[lv].push(player.cardPack[lv].pop()); SFX.pick();
+}
+// 玩家等级可购买的背包最高等级：<10→2，<30→4，<50→5，>=50→6
+function maxBagLvByLevel(lv) { if (lv < 10) return 2; if (lv < 30) return 4; if (lv < 50) return 5; return 6; }
+var shopBtns = [], shopLevel = 0, shopPause = false;
+var LEVEL = 0;
+var LS = 1;   // 难度地图长度系数（COLS 据此缩放）
+
+/* ===================== 游戏引擎 / 世界与实体 ===================== */
+var player = null;
+var enemies = [];
+var bullets = [];
+var ebullets = [];
+var grens = [];
+var drops = [];
+var parts = [];
+var corpses = [];
+var cam = { x: 0, y: 0 };
+var state = 'home';
+var funMode = false;
+var funGoalX = 0;
+var funGoalY = 0;
+var funWeapon = 'pistol';
+var grenAiming = false;
+var holdTimer = 0;
+var ropeReady = false;
+var bannerT = 0;
+var bannerText = '';
+var elapsed = 0;
+var shake = 0;
+var stats = null;
+var resultInfo = null;
+var FUN_THEME = {
+  sky1:'#10243a', sky2:'#2a5a6e', hillFar:'#1c3a4a', hillNear:'#2a5a64',
+  grass:'#5fae62', dirt:'#3a5230', dirtDark:'#27381f', steel:'#6a7078', steelDark:'#3c424a',
+  crate:'#8a5a26', crateDark:'#54340f', green:'#7fb03a', greenD:'#2f5a1c', red:'#d2422c',
+  gold:'#e0bd3e', white:'#e7ecda', ink:'#0a1208', accent:'#46c8d8',
+  cloud:'rgba(255,255,255,0.10)', star:'rgba(255,255,255,0.8)'
+};
+
+/* 跑酷 10 阶：难度=攀爬能力（平台更窄、落差更大），敌方实力恒定 */
+var FUN_LEVELS = [
+  { name: '缓坡',     note: '宽平台·矮落差' },
+  { name: '碎石坡',   note: '略窄·稍高' },
+  { name: '峡谷',     note: '窄台·中落差' },
+  { name: '峭壁',     note: '窄台·高落差' },
+  { name: '裂谷',     note: '更窄·更高' },
+  { name: '云端栈道', note: '窄台·大落差' },
+  { name: '断崖',     note: '极窄·高落差' },
+  { name: '风暴崖',   note: '极窄·更高' },
+  { name: '绝壁',     note: '最窄·很高' },
+  { name: '天梯',     note: '极限窄台·极限落差' }
+];
+var funSelLevel = 0;     // 当前选择的跑酷阶（0..9）
+var funPlats = [];       // 当前跑酷地图平台布局（供布敌使用）
+
+function tileAt(c, r) {
+  if (c < 0 || c >= COLS || r < 0 || r >= ROWS) return 0;
+  return tiles[r * COLS + c];
+}
+function solidAt(c, r) { return tileAt(c, r); }
+function moveX(e, vx) {
+  e.x += vx;
+  if (overlapSolid(e)) {
+    if (vx > 0) e.x = Math.floor((e.x + e.w) / TILE) * TILE - e.w - 0.01;
+    else if (vx < 0) e.x = (Math.floor(e.x / TILE) + 1) * TILE + 0.01;
+    return true;
+  }
+  return false;
+}
+function moveY(e, vy) {
+  e.y += vy;
+  e.onGround = false;
+  if (overlapSolid(e)) {
+    if (vy > 0) { e.y = Math.floor((e.y + e.h) / TILE) * TILE - e.h - 0.01; e.onGround = true; }
+    else if (vy < 0) e.y = (Math.floor(e.y / TILE) + 1) * TILE + 0.01;
+    return true;
+  }
+  return false;
+}
+function overlapSolid(e) {
+  var c0 = Math.floor(e.x / TILE), c1 = Math.floor((e.x + e.w - 1) / TILE);
+  var r0 = Math.floor(e.y / TILE), r1 = Math.floor((e.y + e.h - 1) / TILE);
+  for (var c = c0; c <= c1; c++)
+    for (var r = r0; r <= r1; r++)
+      if (solidAt(c, r)) return true;
+  return false;
+}
+function hasLOS(x1, y1, x2, y2) {
+  var dx = x2 - x1, dy = y2 - y1, dist = Math.sqrt(dx * dx + dy * dy);
+  var steps = Math.ceil(dist / 8);
+  for (var i = 1; i < steps; i++) {
+    var t = i / steps, x = x1 + dx * t, y = y1 + dy * t;
+    if (solidAt(Math.floor(x / TILE), Math.floor(y / TILE))) return false;
+  }
+  return true;
+}
+function groundBelow(ent) {
+  var c = Math.floor((ent.x + ent.w / 2) / TILE);
+  if (c < 0) c = 0; if (c >= COLS) c = COLS - 1;
+  var r = Math.floor(ent.y / TILE);
+  while (r < ROWS && !solidAt(c, r)) r++;
+  return r * TILE;
+}
+
+function genWorld(idx) {
+  var L = LEVELS[idx];
+  TH = Object.assign({}, BASE, L.theme);
+  DIFF = DIFFS[DIFFKEY];
+  LS = DIFF.lenMul;
+  COLS = Math.round(230 * LS); WORLD_W = COLS * TILE;
+  ROWS = 27; WORLD_H = ROWS * TILE;
+  tiles = new Uint8Array(COLS * ROWS);
+  hm = new Array(COLS);
+  ladders = []; redFlags = []; respawnFlag = null; keyHouses = []; houseCrates = {}; extractFlag = null;
+  rope = null; plane = null;
+  var g = L.ground;          // [amp, freq, base, rough, minRow, maxRow, floorRow]
+  var floorRow = g[6];
+  var topR = Math.min(g[4], g[5]);                  // 地表最高处（泥土最少）
+  var botR = Math.max(g[4], g[5]);                  // 地表最低处（泥土最多）
+  var valley = Math.min(ROWS - 2, botR + 2);        // 向下拓展谷地 → 更多起伏
+  for (var c = 0; c < COLS; c++) {
+    // 多层正弦叠加，制造连绵起伏的地形
+    var n = 0.5 + 0.45 * Math.sin(c * g[1]) + 0.22 * Math.sin(c * g[1] * 2.7 + 1.3) + 0.12 * Math.sin(c * g[1] * 5.3 + 0.7);
+    if (n < 0) n = 0; if (n > 1) n = 1;
+    var h = Math.round(topR + (valley - topR) * n + (Math.random() * 2 - 1) * g[3] * 1.4);
+    if (h < topR) h = topR;
+    if (h > valley) h = valley;
+    hm[c] = h;
+    for (var r = h; r < ROWS; r++) tiles[r * COLS + c] = 1;
+  }
+  for (var i = 0; i < L.plat.length; i++) {
+    var pl = L.plat[i];
+    for (var x = 0; x < pl[2]; x++) tiles[pl[1] * COLS + (pl[0] + x)] = 2;
+  }
+  for (var i = 0; i < L.lad.length; i++) {
+    var ld = L.lad[i];
+    var botC = Math.min(ld[2], hm[ld[0]]);          // 梯子底端落到地表，不再插进地下
+    ladders.push({ c: ld[0], top: ld[1], bot: botC });
+  }
+  for (var i = 0; i < L.crates.length; i += 2) {
+    tiles[L.crates[i + 1] * COLS + L.crates[i]] = 3;
+  }
+  var goalC = L.goalC;
+  flag = { x: goalC * TILE + 10, y: hm[goalC] * TILE, h: 70 };
+  rope = { x: (goalC + 3) * TILE, top: 0, bot: hm[goalC] * TILE };
+  plane = { x: (goalC + 5) * TILE, y: -60 };
+  spawn = { x: 90, y: hm[4] * TILE - 40 };
+  // 红旗（敌方据点 / 复活点）仅「地狱」难度出现；简单/困难无红旗
+  if (DIFFKEY === 2) {
+    var rcols = [Math.floor(COLS * 0.28), Math.floor(COLS * 0.55), Math.floor(COLS * 0.8)];
+    for (var i = 0; i < rcols.length; i++) {
+      var rc = Math.max(10, Math.min(COLS - 10, rcols[i]));
+      redFlags.push({ x: rc * TILE + 10, y: hm[rc] * TILE, captured: false, holdT: 0, spawnT: 0 });
+    }
+  }
+  // 房卡房门：仅战役。沿地图分布若干，等级 1~6，房内木箱数 = 2 + (lv-1)*2
+  var hcols = [Math.floor(COLS * 0.34), Math.floor(COLS * 0.62), Math.floor(COLS * 0.82)];
+  for (var hi = 0; hi < hcols.length; hi++) {
+    var hc = Math.max(12, Math.min(COLS - 12, hcols[hi]));
+    var hlv = 1 + ((LEVEL * 2 + hi) % 6);
+    keyHouses.push({ c: hc, x: hc * TILE + 4, y: hm[hc] * TILE, lv: hlv, opened: false });
+  }
+  // 撤离点房门：靠近撤离点，开启会触发远处进攻旗（等级随关卡递增，仅作挑战/奖励，不阻挡撤离）
+  var ec = Math.max(12, goalC - 4);
+  keyHouses.push({ c: ec, x: ec * TILE + 4, y: hm[ec] * TILE, lv: Math.min(6, 3 + LEVEL), opened: false, extraction: true });
+  // 撤离点进攻红旗：常驻于撤离点，每 10 秒召唤一个随机敌兵（不含抢旗手）；不再依赖开门
+  if (!funMode) extractFlag = { x: ec * TILE + 10, y: hm[ec] * TILE, spawnT: 0 };
+}
+
+function isEasy() { return funMode || DIFFKEY === 0; }   // 简单模式（含娱乐关卡）
+function grenInfinite() { return funMode; }   // 仅跑酷模式手雷无限；战役模式需花金币购买、无初始手雷
+function newPlayer() {
+  return {
+    x: spawn.x, y: spawn.y, w: 18, h: 38, vx: 0, vy: 0,
+    face: 1, onGround: false, onLadder: null, crouch: false,
+    hp: 1000, maxHp: 1000, dead: false, deadT: 0,
+    wp: null, mag: { pistol: 0, shotgun: 0, mg: 0, rocket: 0, urocket: 0, bounce: 0 },
+    reserve: 0,
+    grens: 0, fireT: 0, reloadT: 0, hurtT: 0,
+    noise: 0, sprint: false, walk: 0, climbT: 0,
+    respawn: null, noGun: true, stealT: 0, invuln: 0,
+    coins: 100, bar: [null, null, null], bag: [], bagLv: 0, healthPacks: 0, reviveCoins: 0, hasRig: false, books: { 4: 0, 5: 0, 6: 0 }, gunAffix: {},
+    items: [],                                  // 背包中的收集物（每色对应一个实物，每格 1 件，与背包枪共享容量）
+    consumedValue: 0,                           // 战损：累计消耗价值（手雷/血包/房卡等）
+    lootedValue: 0,                             // 捡取收益（吃的钱）：累计拾取物资价值
+    cards: { 1:[], 2:[], 3:[], 4:[], 5:[], 6:[] },   // 拥有的房卡（耐久数组）
+    cardPack: { 1:[], 2:[], 3:[], 4:[], 5:[], 6:[] }, // 卡包（装入后才能 V 开门，耐久数组）
+    sell: { 1:0, 2:0, 3:0, 4:0, 5:0, 6:0 },       // 变卖物（按等级计数）
+    bulletTier: { pistol:1, shotgun:1, mg:1, rocket:1, urocket:1, bounce:1 },  // 子弹等级：1=一级（默认）/2=二级（+50% 伤害）
+    armor: 0, armorHp: 0                         // 护甲：tier(0无/1/2/3) 与剩余可挡子弹数
+  };
+}
+
+// 仅重置「本局战斗」状态（出生点/血量/装填/敌人等），保留玩家跨关的物资与资金（金币、武器栏、背包、物资、房卡、血包、手雷、备弹）
+function resetRun() {
+  if (!player) { player = newPlayer(); return; }
+  player.x = spawn.x; player.y = spawn.y; player.vx = 0; player.vy = 0;
+  player.face = 1; player.onGround = false; player.onLadder = null; player.crouch = false;
+  player.hp = 1000; player.maxHp = 1000; player.dead = false; player.deadT = 0;
+  player.fireT = 0; player.reloadT = 0; player.hurtT = 0;
+  player.noise = 0; player.sprint = false; player.walk = 0; player.climbT = 0;
+  player.respawn = null; player.stealT = 0; player.invuln = 0;
+  player.noGun = true;
+  if (player.bar.indexOf(player.wp) < 0) pickActiveWp();
+}
+
+function puff(x, y, n, col, spd) {
+  for (var i = 0; i < n; i++) {
+    var a = Math.random() * Math.PI * 2, s = (Math.random() * 0.6 + 0.3) * spd;
+    parts.push({ x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 0.5, life: 14 + Math.random() * 10, max: 24, s: 1 + Math.random() * 2, col: col });
+  }
+}
+
+function hurtPlayer(d, isBullet) {
+  if (player.dead) return;
+  if (player.invuln > 0 && d < 999) return;   // 无敌期间免伤（落坑仍致死）
+  if (isBullet && player.armor > 0 && player.armorHp > 0) {   // 护甲抵挡子弹：每发消耗 1 点耐久，不掉血
+    player.armorHp--; player.hurtT = 120; SFX.armor();
+    return;
+  }
+  player.hp -= d;
+  player.hurtT = 220;
+  shake = Math.min(10, shake + d * 0.18);
+  SFX.hurt();
+  if (player.hp <= 0) {
+    player.hp = 0; player.dead = true; player.deadT = 0;
+    stats.deaths++; SFX.die();
+    corpses.push({ x: player.x, y: player.y, face: player.face, helm: TH.greenD, t: 0 });
+    dropDeathBox();   // 主武器与背包掉进木盒；手枪/手雷/血包保留
+  }
+}
+
+// 死亡：除手枪/手雷/血包外，所有主武器 + 背包掉进地上的木盒
+function dropDeathBox() {
+  if (funMode) return;
+  var cargo = [];
+  for (var i = BAR_PISTOL; i < player.bar.length; i++) {
+    if (player.bar[i] && player.bar[i] !== 'pistol') { cargo.push(player.bar[i]); player.bar[i] = null; }
+  }
+  for (var j = player.bag.length - 1; j >= 0; j--) cargo.push(player.bag[j]);
+  if (player.items) for (var k2 = 0; k2 < player.items.length; k2++) cargo.push({ item: true, tier: player.items[k2].tier });
+  var droppedBag = player.bagLv;
+  player.bag = []; player.bagLv = 0; player.items = [];     // 背包容器与物资也掉落
+  if (cargo.length === 0 && droppedBag === 0) return;
+  deathBoxes.push({ x: player.x, y: player.y, w: 30, h: 26, cargo: cargo, bagLv: droppedBag, taken: false, t: 0 });
+  pickActiveWp();
+}
+
+// 按 H 开盒：取回木盒里的装备 + 背包
+function tryOpenBox() {
+  if (funMode) return;
+  for (var i = 0; i < deathBoxes.length; i++) {
+    var b = deathBoxes[i];
+    if (b.taken) continue;
+    if (Math.abs((player.x + player.w / 2) - (b.x + b.w / 2)) < 44 && Math.abs((player.y + player.h) - (b.y + b.h)) < 56) {
+      retrieveBox(b); deathBoxes.splice(i, 1); bannerText = '已取回木盒装备'; bannerT = 1600; return;
+    }
+  }
+}
+function retrieveBox(b) {
+  player.bagLv = Math.max(player.bagLv, b.bagLv || 0);
+  for (var i = 0; i < b.cargo.length; i++) {
+    var gk = b.cargo[i];
+    if (gk && gk.item) {
+      if (player.items.length < ITEM_CAP) player.items.push({ tier: gk.tier });
+      else drops.push({ type: 'item', tier: gk.tier, x: player.x, y: player.y + 10, w: 14, h: 14, t: 0, vy: 0 });
+      continue;
+    }
+    if (ownsGun(gk)) { player.mag[gk] = WEAPONS[gk].mag; continue; }
+    var slot = freeBarSlot(gunKind(gk));
+    if (slot >= 0) player.bar[slot] = gk;
+    else if (bagRoom() > 0) player.bag.push(gk);
+    else drops.push({ type: 'gun', gun: gk, mag: WEAPONS[gk].mag, x: player.x, y: player.y + 10, w: 26, h: 12, t: 0, vy: 0, gold: false });
+  }
+  pickActiveWp();
+}
+
+// 每帧：敌人可能抢走木盒（装备挂在敌人身上，杀了它木盒才重新掉落）
+function updateDeathBoxes() {
+  if (funMode) return;
+  for (var i = deathBoxes.length - 1; i >= 0; i--) {
+    var b = deathBoxes[i];
+    if (b.taken) { deathBoxes.splice(i, 1); continue; }
+    b.t += 1;
+    for (var e = 0; e < enemies.length; e++) {
+      var en = enemies[e];
+      if (en.dead) continue;
+      if (Math.abs((en.x + en.w / 2) - (b.x + b.w / 2)) < 22 && Math.abs((en.y + en.h) - (b.y + b.h)) < 30) {
+        en.carryBox = { cargo: b.cargo, bagLv: b.bagLv };
+        b.taken = true;
+        break;
+      }
+    }
+  }
+}
+
+function explode(x, y, rad, dmg, fromPlayer, kill) {
+  boom(); shake = Math.min(14, shake + 8);
+  var R = rad * TILE;
+  for (var i = 0; i < 26; i++) {
+    var a = Math.random() * Math.PI * 2, s = Math.random() * 4 + 1;
+    parts.push({ x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 1, life: 20 + Math.random() * 16, max: 36, s: 2 + Math.random() * 2, col: Math.random() < 0.5 ? '#ffae5a' : '#ffd27a' });
+  }
+  var c0 = Math.floor((x - R) / TILE), c1 = Math.floor((x + R) / TILE);
+  var r0 = Math.floor((y - R) / TILE), r1 = Math.floor((y + R) / TILE);
+  for (var c = c0; c <= c1; c++) for (var r = r0; r <= r1; r++) {
+    if (c < 0 || c >= COLS || r < 0 || r >= ROWS) continue;
+    var dx = (c * TILE + 10) - x, dy = (r * TILE + 10) - y;
+    if (dx * dx + dy * dy <= R * R && tiles[r * COLS + c] === 3) breakCrate(c, r);
+  }
+  if (fromPlayer) {
+    for (var i = 0; i < enemies.length; i++) {
+      var e = enemies[i]; if (e.dead) continue;
+      var dx = (e.x + e.w / 2) - x, dy = (e.y + e.h / 2) - y;
+      if (dx * dx + dy * dy <= R * R) { if (kill) killEnemy(e); else hurtEnemy(e, dmg); }
+    }
+  } else if (!player.dead) {
+    var dx = (player.x + player.w / 2) - x, dy = (player.y + player.h / 2) - y;
+    if (dx * dx + dy * dy <= R * R) hurtPlayer(dmg * ENEMY_DMG_MUL);
+  }
+}
+
+// 反弹枪范围伤害：以 (x,y) 为圆心、radiusPx 为半径内的所有敌人各受一次等量伤害
+function splashDamage(x, y, radiusPx, dmgPct) {
+  if (!radiusPx || radiusPx <= 0) return;
+  var R2 = radiusPx * radiusPx;
+  for (var j = 0; j < enemies.length; j++) {
+    var e = enemies[j]; if (e.dead) continue;
+    var dx = (e.x + e.w / 2) - x, dy = (e.y + e.h / 2) - y;
+    if (dx * dx + dy * dy <= R2) hurtEnemy(e, e.maxHp * dmgPct / 100);
+  }
+}
+
+// 反弹枪子弹撞墙：按入墙前的位置判断轴向，翻转对应速度并回到入墙前的坐标
+function reflectBullet(b, ox, oy, c, r) {
+  var oc = Math.floor(ox / TILE), orow = Math.floor(oy / TILE);
+  var bx = (oc !== c) && solidAt(oc, r);
+  var by = (orow !== r) && solidAt(c, orow);
+  if (bx && !by) b.vx = -b.vx;
+  else if (by && !bx) b.vy = -b.vy;
+  else { b.vx = -b.vx; b.vy = -b.vy; }
+  b.x = ox; b.y = oy;
+}
+
+function breakCrate(c, r) {
+  if (c < 0 || c >= COLS || r < 0 || r >= ROWS) return;
+  if (tiles[r * COLS + c] !== 3) return;
+  tiles[r * COLS + c] = 0;
+  for (var i = 0; i < 10; i++) puff(c * TILE + 10, r * TILE + 10, 1, TH.crate, 2);
+  var x0 = c * TILE, y0 = r * TILE;
+  var hk = houseCrates[c * ROWS + r];   // 房卡房内的木箱记录其房卡等级，否则为野外箱
+  crateRoll(x0, y0, hk ? hk : 0);
+}
+
+// 统一掉落：houseLv>0 表示房卡房内木箱（爆率更高），0 表示野外木箱（爆率÷2）
+function crateRoll(x0, y0, houseLv) {
+  var house = houseLv > 0;
+  var dm = (DIFF && DIFF.dropMul) ? DIFF.dropMul : 1;
+  var gm = (DIFFKEY === 1) ? 1.3 : (DIFFKEY === 2 ? 1.6 : 1);   // 困难/地狱「好东西」概率更高
+  var fm = house ? 1 : 0.5;             // 野外木箱除以2（难度越高的模式整体爆率更高）
+  // 武器（房卡房有概率出金色超级火箭炮）；困难/地狱额外提升好东西概率
+  if (Math.random() < (house ? 0.30 : 0.15) * fm * dm * gm) {
+    var pool = house ? ['pistol', 'shotgun', 'mg', 'rocket', 'bounce', 'urocket'] : ['pistol', 'shotgun', 'mg', 'rocket', 'bounce'];
+    var g = pool[(Math.random() * pool.length) | 0];
+    var gold = (g === 'urocket');
+    drops.push({ type: 'gun', gun: g, mag: WEAPONS[g].mag, x: x0 + 2, y: y0, w: 26, h: 12, t: 0, vy: 0, gold: gold });
+    if (gold) for (var gi = 0; gi < 14; gi++) puff(x0 + 10, y0 + 8, 1, '#ffd86a', 2.6);
+  }
+  // 手雷
+  if (Math.random() < (house ? 0.15 : 0.08) * fm * dm)
+    drops.push({ type: 'gren', x: x0 + 4, y: y0, w: 12, h: 12, t: 0, vy: 0 });
+  // 金币（仅战役）
+  if (!funMode && Math.random() < (house ? 0.7 : 0.35) * fm * dm)
+    drops.push({ type: 'coin', val: 2 + (Math.random() * 4 | 0) + (house ? 2 : 0), x: x0 + 6, y: y0, w: 10, h: 10, t: 0, vy: 0 });
+  // 房卡 + 变卖物（仅战役）；困难/地狱房卡更易出，且更易出高级卡
+  if (!funMode) {
+    if (Math.random() < (house ? 0.14 : 0.09) * fm * dm * gm) {
+      var clv;
+      if (house) {
+        var up = (DIFFKEY >= 1 && Math.random() < 0.5) ? 2 : 1;   // 困难/地狱有更高概率掉落进阶卡
+        clv = Math.min(6, houseLv + up);
+      } else {
+        clv = 1 + (Math.random() * 3 | 0);                        // 野外掉 1~3 级，可开启低级房
+      }
+      drops.push({ type: 'card', lv: clv, x: x0 + 3, y: y0 - 2, w: 14, h: 14, t: 0, vy: 0 });
+    }
+    if (Math.random() < (house ? 0.18 : 0.05) * fm * dm) {
+      var slv = house ? 1 + (Math.random() * 6 | 0) : 1 + (Math.random() * 3 | 0);
+      drops.push({ type: 'sell', lv: slv, x: x0 + 3, y: y0 - 2, w: 14, h: 14, t: 0, vy: 0 });
+    }
+    // 收集物（六色战利品：白/绿/蓝/紫/金/红；红最高 1 万）：全关卡全难度都可出红/金，房卡房&高难偏向高阶
+    if (Math.random() < (house ? 0.26 : 0.16) * fm * dm * gm * ITEM_DROP_MUL) {
+      var it, r2 = Math.random();
+      if (house) {
+        if (DIFFKEY >= 2) {            // 地狱：高阶占比最高
+          if (r2 < 0.22) it = 6; else if (r2 < 0.45) it = 5; else if (r2 < 0.68) it = 4; else if (r2 < 0.85) it = 3; else if (r2 < 0.95) it = 2; else it = 1;
+        } else if (DIFFKEY >= 1) {     // 困难
+          if (r2 < 0.16) it = 6; else if (r2 < 0.36) it = 5; else if (r2 < 0.58) it = 4; else if (r2 < 0.78) it = 3; else if (r2 < 0.92) it = 2; else it = 1;
+        } else {                       // 简单（房卡房）：红/金仍可出
+          if (r2 < 0.10) it = 6; else if (r2 < 0.26) it = 5; else if (r2 < 0.50) it = 4; else if (r2 < 0.72) it = 3; else if (r2 < 0.88) it = 2; else it = 1;
+        }
+      } else {                         // 野外：各级均可出，红色概率低但存在
+        if (r2 < 0.05) it = 6; else if (r2 < 0.15) it = 5; else if (r2 < 0.35) it = 4; else if (r2 < 0.60) it = 3; else if (r2 < 0.82) it = 2; else it = 1;
+      }
+      drops.push({ type: 'item', tier: it, x: x0 + 3, y: y0 - 2, w: 14, h: 14, t: 0, vy: 0 });
+    }
+    // 词条书（紫/金/红 三档；给枪械加词条变强；房卡房更易出高阶）
+    if (!funMode && Math.random() < (house ? 0.16 : 0.05) * fm * dm) {
+      var bt = house ? (Math.random() < 0.15 ? 6 : (Math.random() < 0.45 ? 5 : 4)) : (Math.random() < 0.2 ? 5 : 4);
+      drops.push({ type: 'book', tier: bt, x: x0 + 3, y: y0 - 2, w: 14, h: 14, t: 0, vy: 0 });
+    }
+  }
+}
+
+function hurtEnemy(e, dmg, raw) {
+  if (e.dead) return;
+  dmg = raw ? dmg : dmg * DIFF.dmgMul;
+  e.hp -= dmg;
+  e.hurtT = 160;
+  if (e.hp <= 0) {
+    e.hp = 0; e.dead = true; e.deadT = 0;
+    stats.kills++;
+    corpses.push({ x: e.x, y: e.y, face: e.face, helm: e.t.helm, t: 0 });
+    for (var i = 0; i < 8; i++) puff(e.x + 9, e.y + 18, 1, '#a04030', 2);
+    if (Math.random() < 0.4) drops.push({ type: 'gun', gun: e.t.drop, mag: WEAPONS[e.t.drop].mag, x: e.x, y: e.y + 20, w: 26, h: 12, t: 0, vy: 0 });
+    if (Math.random() < 0.25) drops.push({ type: 'gren', x: e.x + 4, y: e.y + 20, w: 12, h: 12, t: 0, vy: 0 });
+    if (!funMode && Math.random() < 0.85) drops.push({ type: 'coin', val: Math.max(2, Math.floor(e.t.hp / 30)), x: e.x + 4, y: e.y + 20, w: 10, h: 10, t: 0, vy: 0 });
+  }
+}
+
+function killEnemy(e) {
+  if (e.dead) return;
+  e.hp = 0; e.dead = true; e.deadT = 0;
+  stats.kills++;
+  corpses.push({ x: e.x, y: e.y, face: e.face, helm: e.t.helm, t: 0 });
+  for (var i = 0; i < 8; i++) puff(e.x + 9, e.y + 18, 1, '#a04030', 2);
+  if (Math.random() < 0.4) drops.push({ type: 'gun', gun: e.t.drop, mag: WEAPONS[e.t.drop].mag, x: e.x, y: e.y + 20, w: 26, h: 12, t: 0, vy: 0 });
+  if (Math.random() < 0.25) drops.push({ type: 'gren', x: e.x + 4, y: e.y + 20, w: 12, h: 12, t: 0, vy: 0 });
+  if (!funMode && Math.random() < 0.85) drops.push({ type: 'coin', val: Math.max(2, Math.floor(e.t.hp / 30)), x: e.x + 4, y: e.y + 20, w: 10, h: 10, t: 0, vy: 0 });
+  if (e.carryBox) { deathBoxes.push({ x: e.x, y: e.y, w: 30, h: 26, cargo: e.carryBox.cargo.slice(), bagLv: e.carryBox.bagLv, taken: false, t: 0 }); e.carryBox = null; }
+}
+
+function respawn() {
+  var x, y;
+  if (player.respawn) { x = player.respawn.x; y = player.respawn.y; }
+  else { var c = Math.floor((spawn.x + 9) / TILE); x = spawn.x; y = hm[c] * TILE - player.h; }
+  player.x = x; player.y = y; player.vx = 0; player.vy = 0;
+  player.dead = false; player.deadT = 0; player.hp = player.maxHp;
+  player.noGun = false; player.onLadder = null; player.crouch = false; player.h = 38;
+  player.invuln = 5000;   // 复活后 5 秒无敌（期间不可开火、免伤）
+  if (!funMode) {
+    if (player.reviveCoins > 0) player.reviveCoins--;        // 优先消耗复活币
+    else player.coins = Math.max(0, player.coins - RESPAWN_COST);
+  }
+}
+// 阵亡菜单选择复活：战役扣 RESPAWN_COST 金；金币不足则直接游戏结束
+function doRespawn() {
+  if (funMode) { respawn(); state = 'play'; return; }
+  if (player.reviveCoins > 0 || player.coins >= RESPAWN_COST) { respawn(); state = 'play'; return; }
+  resultInfo = { win: false, final: false, time: Math.round(elapsed / 1000), kills: stats.kills, deaths: stats.deaths }; state = 'result';
+}
+function drawDeathMenu() {
+  deadBtns = [];
+  ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, 0, VW, VH);
+  var pw = 480, ph = 240, px = VW / 2 - pw / 2, py = VH / 2 - ph / 2;
+  rr(px, py, pw, ph, '#0c1a0c'); rr(px, py, pw, 3, TH.red);
+  txt('你 阵 亡 了', VW / 2, py + 46, TH.red, 34, 'center');
+  var useCoin = player.reviveCoins > 0;
+  txt(useCoin ? ('复活需 1 复活币（持有 ' + player.reviveCoins + ' 个）') : ('复活需要 ' + RESPAWN_COST + ' 金币（当前 ' + player.coins + ' 金）'), VW / 2, py + 88, '#cfe0bc', 15, 'center');
+  var bw = 200, bh = 50, gap = 24, by = py + 128;
+  var bx1 = VW / 2 - bw - gap / 2, bx2 = VW / 2 + gap / 2;
+  var h1 = mouse.x > bx1 && mouse.x < bx1 + bw && mouse.y > by && mouse.y < by + bh;
+  rr(bx1, by, bw, bh, h1 ? TH.greenD : '#14260f'); rr(bx1, by, bw, 2, TH.green);
+  txt(useCoin ? ('用复活币复活（剩 ' + player.reviveCoins + '）') : ('复活（-' + RESPAWN_COST + ' 金）'), bx1 + bw / 2, by + 32, h1 ? TH.white : '#cfe0bc', 17, 'center');
+  deadBtns.push({ r: [bx1, by, bw, bh], cb: function () { doRespawn(); } });
+  var h2 = mouse.x > bx2 && mouse.x < bx2 + bw && mouse.y > by && mouse.y < by + bh;
+  rr(bx2, by, bw, bh, h2 ? '#3a1a1a' : '#1a1410'); rr(bx2, by, bw, 2, '#a05a4a');
+  txt('放弃任务', bx2 + bw / 2, by + 32, h2 ? TH.white : '#c9a0a0', 17, 'center');
+  deadBtns.push({ r: [bx2, by, bw, bh], cb: function () { resultInfo = { win: false, final: false, time: Math.round(elapsed / 1000), kills: stats.kills, deaths: stats.deaths }; state = 'result'; } });
+}
+
+function grenadeLaunch() {
+  var ox = player.x + player.w / 2, oy = player.y + 14;
+  var mwx = mouse.x + cam.x, mwy = mouse.y + cam.y;
+  var ang = Math.atan2(mwy - oy, mwx - ox);
+  var sp = 8.5;
+  return { ox: ox, oy: oy, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp - 1.6 };
+}
+function simGrenade(ox, oy, vx, vy) {
+  var pts = [], x = ox, y = oy, gx = vx, gy = vy, land = null;
+  for (var i = 0; i < 140; i++) {
+    gy += 0.42; x += gx; y += gy;
+    var c = Math.floor(x / TILE), r = Math.floor(y / TILE);
+    if (solidAt(c, r) || y > WORLD_H) { land = { x: x, y: y }; break; }
+    if (i % 2 === 0) pts.push({ x: x, y: y });
+    if (y > WORLD_H + 200) break;
+  }
+  if (!land) land = { x: x, y: y };
+  return { pts: pts, land: land };
+}
+function throwGren() {
+  // 无敌期间允许投弹：开火（子弹）被禁，但手雷不受无敌限制，可照常投掷
+  if (!player || player.dead) return;
+  if (player.grens <= 0 && !grenInfinite()) return;   // 仅简单难度可无限投掷，其余需有库存
+  var L = grenadeLaunch();
+  grens.push({ x: L.ox, y: L.oy, w: 8, h: 8, vx: L.vx, vy: L.vy, t: 0 });
+  if (!grenInfinite()) { player.grens--; player.consumedValue += SHOP_PRICES.grenade; }   // 战役模式按库存递减并计入战损
+  SFX.toss();
+}
+
+function reloadTime(w) {
+  var t = w.reload;
+  if (w.autoReload) t *= 0.95;                          // RPG / 超级火箭炮 换弹速度 +5%
+  if (w.key === 'mg' && player.mag['mg'] > 0) t *= 0.5; // 机枪：仍有余弹时换弹减半（仅本次）
+  return t;
+}
+function tryReload() {
+  if (player.reloadT > 0 || player.noGun || player.wp === 'knife') return;
+  var w = WEAPONS[player.wp];
+  if (player.mag[player.wp] >= w.mag) return;
+  if (player.reserve <= 0) return;
+  player.reloadT = reloadTime(w);
+  player.reloadDur = player.reloadT;
+  SFX.reload();
+}
+function finishReload() {
+  var w = WEAPONS[player.wp];
+  var need = w.mag - player.mag[player.wp];
+  var take = Math.min(need, player.reserve);
+  player.mag[player.wp] += take;
+  player.reserve -= take;
+}
+
+function playerShoot() {
+  var p = player;
+  if (p.dead || p.noGun || !p.wp) return;
+  if (p.invuln > 0) return;   // 无敌期间不可开火
+  if (p.wp === 'knife') { playerKnife(); return; }
+  var w = WEAPONS[p.wp];
+  if (p.reloadT > 0) return;
+  var cost = w.volley ? w.volley : 1;            // 超级火箭炮：一次打 5 颗
+  if (!funMode) {
+    if (p.mag[p.wp] < cost) { tryReload(); return; }
+    p.mag[p.wp] -= cost;
+    player.consumedValue += cost * BULLET_COST;   // 打掉的子弹计入战损
+  }
+  p.fireT = gRate(p.wp);
+  stats.shots++;
+  var mx = mouse.x + cam.x, my = mouse.y + cam.y;
+  var px = p.x + p.w / 2, py = p.y + (p.crouch ? 12 : 14);
+  var ang = Math.atan2(my - py, mx - px);
+  var n = w.volley ? w.volley : w.pellets;
+  var sp = w.volley ? 0.16 : w.spread;          // 5 连发带小幅散布
+  var life = Math.round(w.range / w.speed);
+  if (w.bounce) life += w.bounce * 5;           // 反弹枪：为多次弹跳预留飞行时间
+  for (var i = 0; i < n; i++) {
+    var a = ang + (Math.random() * 2 - 1) * sp;
+    var sx = Math.cos(a), sy = Math.sin(a);
+    bullets.push({ x: px + sx * 16, y: py + sy * 16, vx: sx * w.speed, vy: sy * w.speed, life: life, dmg: gDmg(p.wp), explosive: !!w.explosive, bounce: w.bounce || 0, splash: w.splash ? w.splash * 10 : 0, pierce: w.pierce || 0, hit: [] });
+  }
+  p.noise = 1.0;
+  SFX[w.key === 'mg' ? 'mg' : w.key === 'shotgun' ? 'sg' : (w.key === 'rocket' || w.key === 'urocket') ? 'rl' : 'shot']();
+}
+
+function playerKnife() {
+  var p = player;
+  // 仅在「贴脸」（最近敌人进入近战范围）时才能挥刀；否则无法攻击且不消耗冷却
+  var px = p.x + p.w / 2, py = p.y + p.h / 2;
+  var best = null, bestD = Infinity;
+  for (var i = 0; i < enemies.length; i++) {
+    var e = enemies[i]; if (e.dead) continue;
+    var d = Math.hypot((e.x + e.w / 2) - px, (e.y + e.h / 2) - py);
+    if (d < bestD) { bestD = d; best = e; }
+  }
+  if (!best || bestD > WEAPONS.knife.range) return;   // 没贴脸 → 不可攻击
+  p.fireT = WEAPONS.knife.rate;            // 每一秒挥一次
+  stats.shots++;
+  hurtEnemy(best, best.maxHp / 3, true);   // 一次刀造成 1/3 敌方血量（不受难度伤害系数影响）
+  p.noise = 0.3;
+  SFX.knife();
+}
+
+function dropWeapon() {
+  if (player.noGun || player.dead || player.wp === 'knife') return;   // 持刀时不可收起（刀是默认近战，无枪即自动持有）
+  player.noGun = true;   // 收起武器（背包仍拥有，按 1/2/3 重新装备）
+  SFX.toss();
+}
+function tryPickup() {
+  for (var i = 0; i < drops.length; i++) {
+    var d = drops[i];
+    if (Math.abs((d.x + d.w / 2) - (player.x + player.w / 2)) < 24 && Math.abs((d.y + d.h / 2) - (player.y + player.h / 2)) < 30) {
+      if (d.type === 'gren') { if (player.grens < GREN_CAP) { player.grens++; player.lootedValue += SHOP_PRICES.grenade; } drops.splice(i, 1); SFX.pick(); return; }
+      if (d.type === 'gun') {
+        var gk = d.gun;
+        if (ownsGun(gk)) {
+          player.mag[gk] = WEAPONS[gk].mag;
+          if (player.bar.indexOf(gk) >= 0) { player.wp = gk; player.noGun = false; }
+          drops.splice(i, 1); SFX.pick(); return;
+        }
+        if (!canCarry(gk)) return;   // 武器栏与背包都无空位
+        var k = gunKind(gk), slot = freeBarSlot(k);
+        if (slot >= 0) { player.bar[slot] = gk; player.wp = gk; player.noGun = false; }
+        else { player.bag.push(gk); }
+        player.mag[gk] = d.mag; player.lootedValue += gunVal(gk);
+        drops.splice(i, 1); SFX.pick(); return;
+      }
+    }
+  }
+}
+
+function makeEnemy(t, x, y) {
+  return {
+    t: t, x: x, y: y, w: 18, h: 38, vx: 0, vy: 0, face: -1,
+    hp: t.hp, maxHp: t.hp, dead: false, deadT: 0, hurtT: 0,
+    onGround: false, alert: false, alertT: 0, patrol: Math.random() * 2000,
+    dir: Math.random() < 0.5 ? -1 : 1, fireT: Math.random() * 800, walk: 0, stealT: 0
+  };
+}
+function spawnEnemies() {
+  enemies = [];
+  var L = LEVELS[LEVEL];
+  var cnt = Math.round(L.enemies.count * DIFF.eMul * ENEMY_COUNT_MUL);
+  var types = L.enemies.types.slice();
+  if (DIFFKEY === 2 && types.indexOf(6) < 0) types.push(6);
+  for (var i = 0; i < cnt; i++) {
+    var t = ETYPES[types[i % types.length]];
+    var col = 20 + Math.floor(Math.random() * (COLS - 40));
+    var gy = (hm[col] - 2) * TILE;
+    enemies.push(makeEnemy(t, col * TILE + 2, gy));
+  }
+}
+function respawnPoint() {
+  if (player && player.respawn) return { x: player.respawn.x, y: player.respawn.y + player.h };
+  var c = Math.floor((spawn.x + 9) / TILE);
+  return { x: spawn.x, y: hm[c] * TILE };
+}
+function spawnRandomEnemy(gx, gy) {
+  var idx;
+  do { idx = Math.floor(Math.random() * ETYPES.length); } while (ETYPES[idx].stealer);   // 排除抢旗手
+  var e = makeEnemy(ETYPES[idx], gx, gy - 38);
+  e.alert = true; e.alertT = 3000;   // 立即警觉、扑向玩家
+  enemies.push(e);
+  puff(gx + 9, gy - 12, 10, '#e44', 2.5);
+  SFX.crate();
+}
+function enemyShoot(e) {
+  var ex = e.x + e.w / 2, ey = e.y + 14;
+  var px = player.x + player.w / 2, py = player.y + 18;
+  var ang = Math.atan2(py - ey, px - ex);
+  var spread = 0.09;
+  var pellets = e.t.pellets || 1;
+  for (var i = 0; i < pellets; i++) {
+    var a = ang + (Math.random() * 2 - 1) * spread;
+    var sx = Math.cos(a), sy = Math.sin(a);
+    var bs = e.t.bspeed || 8;
+    ebullets.push({ x: ex + sx * 16, y: ey + sy * 16, vx: sx * bs, vy: sy * bs, life: Math.round(e.t.range / bs), dmg: e.t.dmg * ENEMY_DMG_MUL, explosive: !!e.t.explosive });
+  }
+  SFX[e.t.w === 'mg' ? 'mg' : e.t.w === 'shotgun' ? 'sg' : e.t.w === 'rocket' ? 'rl' : 'shot']();
+}
+
+function startGame(lv) {
+  if (typeof lv === 'number') LEVEL = lv;
+  if (LEVEL >= LEVELS.length) LEVEL = 0;
+  funMode = false;
+  DIFF = DIFFS[DIFFKEY];
+  LS = DIFF.lenMul;
+  genWorld(LEVEL);
+  if (!player) {
+    player = newPlayer();
+    player.bagLv = 1;                 // 直接开战/教学：赠送 1 级背包 + 手枪
+    player.bar = ['pistol', null, null];
+    player.wp = 'pistol';
+    player.mag.pistol = WEAPONS.pistol.mag;
+    player.reserve = 60;
+  } else {
+    resetRun();                      // 已存在玩家（如从暂停/结果返回）：保留物资与资金，仅重置本局状态
+  }
+  deathBoxes = [];
+  spawnEnemies();
+  bullets = []; ebullets = []; grens = []; drops = []; parts = []; corpses = [];
+  cam.x = 0; cam.y = 0; elapsed = 0; shake = 0; holdTimer = 0; ropeReady = false; grenAiming = false;
+  stats = { kills: 0, deaths: 0, killStreak: 0, shots: 0 };
+  bannerT = 2200; bannerText = '第 ' + (LEVEL + 1) + ' 关 · ' + LEVELS[LEVEL].name;
+  state = 'play';
+}
+function nextLevel() {
+  bagLevelBonus = Math.min(6, bagLevelBonus + 1);   // 每通关一关 +1 免费背包等级
+  playerLevel = Math.min(99, playerLevel + 1);       // 玩家等级 +1
+  var nl = Math.min(LEVELS.length - 1, LEVEL + 1);
+  openShop(nl);
+}
+function startCampaign(wp, lv) {
+  startGame(lv);
+  player.mag = { pistol: 0, shotgun: 0, mg: 0, rocket: 0, urocket: 0, bounce: 0 };
+  player.bar = [null, null, null];
+  if (gunKind(wp) === 'pistol') player.bar[BAR_PISTOL] = wp; else player.bar[BAR_PRIM1] = wp;
+  player.wp = wp;
+  player.mag[wp] = WEAPONS[wp].mag;
+  player.reserve = 500;
+  bannerText = '第 ' + (lv + 1) + ' 关 · ' + LEVELS[lv].name + ' · ' + WEAPONS[wp].name;
+}
+function winGame() {
+  playerLevel = Math.min(99, playerLevel + 1);       // 通关也算一级
+  if (funMode) {
+    var fl = funSelLevel;
+    funMode = false;
+    resultInfo = { win: true, fun: true, funLevel: fl, final: fl >= FUN_LEVELS.length - 1, time: Math.round(elapsed / 1000), kills: stats.kills, deaths: stats.deaths };
+    state = 'result'; SFX.win(); return;
+  }
+  resultInfo = { win: true, final: (LEVEL + 1 >= LEVELS.length), time: Math.round(elapsed / 1000), kills: stats.kills, deaths: stats.deaths };
+  state = 'result'; SFX.win();
+}
+function giveUp() {
+  resultInfo = { win: false, final: false, time: Math.round(elapsed / 1000), kills: stats.kills, deaths: stats.deaths };
+  state = 'result';
+}
+
+/* ===================== 商城 / 经济 ===================== */
+function buyWeapon(wk) {
+  if (!player || player.dead) return;
+  if (ownsGun(wk)) return;
+  if (!canCarry(wk)) return;
+  var price = SHOP_PRICES[wk];
+  if (price === undefined) return;          // 不可购买的枪（urocket / bounce 等）直接拒绝，避免金币变 NaN
+  if (player.coins < price) return;
+  player.coins -= price;
+  var k = gunKind(wk), slot = freeBarSlot(k);
+  if (slot >= 0) { player.bar[slot] = wk; player.wp = wk; player.noGun = false; }
+  else { player.bag.push(wk); }
+  player.mag[wk] = WEAPONS[wk].mag;
+  player.reserve += WEAPONS[wk].mag;
+  SFX.pick();
+}
+function buyAmmo() {
+  if (!player || player.coins < SHOP_PRICES.ammo) return;
+  player.coins -= SHOP_PRICES.ammo; player.reserve += 50; SFX.pick();
+}
+function buyHealth() {
+  if (!player) return;
+  if (!player.hasRig) { bannerText = '需先装备「胸挂」才能携带血包（商城可购买）'; bannerT = 1800; return; }
+  if (player.healthPacks >= MAX_HEALTHPACKS || player.coins < SHOP_PRICES.health) return;
+  player.coins -= SHOP_PRICES.health; player.healthPacks++; SFX.pick();
+}
+function buyGrenade() {
+  if (!player || player.coins < SHOP_PRICES.grenade) return;
+  if (player.grens >= GREN_CAP) return;
+  player.coins -= SHOP_PRICES.grenade; player.grens++; SFX.pick();
+}
+function buyCard(lv) {
+  if (!player || player.dead || funMode) return;          // 房卡仅战役可用
+  var price = CARD_PRICES[lv];
+  if (!price || player.coins < price) return;
+  player.coins -= price;   player.cards[lv].push(CARD_DURA); SFX.pick();
+}
+function buyReviveCoin() {
+  if (!player || player.dead || funMode) return;
+  if (player.reviveCoins >= REVIVE_COIN_MAX) return;
+  if (player.coins < REVIVE_COIN_PRICE) return;
+  player.coins -= REVIVE_COIN_PRICE; player.reviveCoins++; SFX.pick();
+}
+function buyRig() {
+  if (!player || player.dead || funMode) return;
+  if (player.hasRig) return;
+  if (player.coins < RIG_PRICE) return;
+  player.coins -= RIG_PRICE; player.hasRig = true; SFX.pick();
+}
+function buyArmor(tier) {
+  if (!player) return;
+  var def = ARMOR_DEFS[tier]; if (!def) return;
+  if (player.armor > tier) return;                                       // 已有更高级，不能买低级
+  if (player.armor === tier && player.armorHp >= def.blocks) return;     // 同级已满，勿重复购买
+  if (player.coins < def.price) return;
+  player.coins -= def.price; player.armor = tier; player.armorHp = def.blocks; SFX.pick();
+}
+function armorSub(t) {
+  var d = ARMOR_DEFS[t];
+  if (player.armor > t) return '已有更高级护甲';
+  if (player.armor === t) return player.armorHp > 0 ? ('当前 ' + player.armorHp + '/' + d.blocks + ' 发') : ('已耗尽 · 重购 ' + d.price + ' 金');
+  return '抵挡 ' + d.blocks + ' 发 · ' + d.price + ' 金';
+}
+function armorCan(t) {
+  var d = ARMOR_DEFS[t];
+  if (player.armor > t) return false;
+  if (player.armor === t) return player.armorHp < d.blocks && player.coins >= d.price;
+  return player.coins >= d.price;
+}
+function buyBook(tier) {
+  if (!player || player.dead || funMode) return;
+  var price = BOOK_PRICES[tier]; if (!price) return;
+  if (player.coins < price) return;
+  player.coins -= price; player.books[tier] = (player.books[tier] || 0) + 1; SFX.pick();
+}
+function applyBook(gk, tier) {
+  if (!ownsGun(gk) || !player.books[tier] || player.books[tier] <= 0) return;
+  player.books[tier]--;
+  if (!player.gunAffix[gk]) player.gunAffix[gk] = { dmg: 0, rate: 0 };
+  player.gunAffix[gk].dmg += BOOK_AFFIX[tier].dmg;
+  player.gunAffix[gk].rate += BOOK_AFFIX[tier].rate;
+  if (bagAffixTarget === gk) bagAffixTarget = null;
+  SFX.pick();
+}
+function applyBookBest(gk) {
+  if (!ownsGun(gk)) return;
+  for (var i = BOOK_TIERS.length - 1; i >= 0; i--) { var t = BOOK_TIERS[i]; if (player.books[t] > 0) { applyBook(gk, t); return; } }
+}
+// 子弹升级：把指定枪的子弹升到二级（伤害 ×1.5），花费高于普通弹药，并附赠备弹
+function upgradeBullet(k) {
+  if (!player || player.dead) return;
+  if (!ownsGun(k)) { bannerText = '需先拥有 ' + WEAPONS[k].name + ' 才能升级子弹'; bannerT = 1500; return; }
+  if (player.bulletTier[k] >= 2) { bannerText = WEAPONS[k].name + ' 已是二级子弹'; bannerT = 1400; return; }
+  if (player.coins < BULLET_UPGRADE_COST) { bannerText = '金币不足（升级需 ' + BULLET_UPGRADE_COST + ' 金）'; bannerT = 1400; return; }
+  player.coins -= BULLET_UPGRADE_COST;
+  player.bulletTier[k] = 2;
+  player.reserve += BULLET_UPGRADE_AMMO;
+  SFX.pick();
+}
+function buyBag(lv, cost) {
+  if (!player || player.dead) return;
+  if (player.bagLv >= lv) return;
+  var maxLv = maxBagLvByLevel(playerLevel);
+  if (lv > maxLv) { bannerText = '玩家等级 ' + playerLevel + ' 级才能购买 ' + lv + ' 级背包'; bannerT = 1800; return; }
+  if (player.coins < cost) return;
+  player.coins -= cost; player.bagLv = lv; SFX.pick();
+}
+function openShop(lv) {
+  funMode = false;
+  LEVEL = Math.max(0, Math.min(LEVELS.length - 1, lv | 0));
+  DIFF = DIFFS[DIFFKEY]; LS = DIFF.lenMul;
+  genWorld(LEVEL);
+  resetRun();                     // 保留跨关物资与资金，仅重置本局战斗状态（位置/血量/装填等）
+  deathBoxes = [];
+  player.bagLv = Math.max(player.bagLv, Math.min(6, bagLevelBonus));   // 每通关 +1 免费背包等级，并保留已购背包等级
+  spawnEnemies();
+  bullets = []; ebullets = []; grens = []; drops = []; parts = []; corpses = [];
+  cam.x = 0; cam.y = 0; elapsed = 0; shake = 0; holdTimer = 0; ropeReady = false; grenAiming = false;
+  stats = { kills: 0, deaths: 0, killStreak: 0, shots: 0 };
+  shopLevel = LEVEL; shopPause = false;
+  bannerT = 0; bannerText = '';
+  state = 'shop';
+}
+function openShopPause() {
+  if (funMode) return;
+  shopPause = true; state = 'shop';
+}
+
+// 用卡包内对应等级房卡开启房卡房门：消耗一张卡的耐久，刷出 2+(lv-1)*2 个房卡房木箱，并必掉一张进阶房卡
+function openKeyHouse(h) {
+  if (!h || h.opened) return;
+  h.opened = true;
+  var n = 2 + (h.lv - 1) * 2;
+  for (var k = 0; k < n; k++) {
+    var col2 = h.c + 1 + k;
+    if (col2 > COLS - 5) col2 = h.c - 1 - k;
+    if (col2 < 4 || col2 > COLS - 4) continue;
+    var r = hm[col2];
+    tiles[r * COLS + col2] = 3;
+    houseCrates[col2 * ROWS + r] = h.lv;
+  }
+  drops.push({ type: 'card', lv: Math.min(6, h.lv + 1), x: h.x + 2, y: h.y - 30, w: 14, h: 14, t: 0, vy: 0 });
+  SFX.setpt();
+  bannerText = '已开启 ' + h.lv + ' 级房卡房！'; bannerT = 1800;
+  // 撤离点进攻由常驻的 extractFlag 负责（见 genWorld），开门不再触发刷兵
+}
+// 尝试用卡包开门（V 键 / 点门触发）：从卡包取对应等级房卡，按难度扣耐久；任意≥1 耐久的卡都能强行开门（扣剩余耐久，归零作废）
+function tryOpenDoor(h) {
+  if (!h || h.opened || !player) return;
+  var arr = player.cardPack[h.lv];
+  if (!arr || arr.length === 0) { bannerText = '卡包内需要 K' + h.lv + ' 房卡（仓库「装入卡包」）'; bannerT = 1600; return; }
+  if (arr[0] < 1) { arr.shift(); return; }                 // 防御：耐久非法则丢弃该卡
+  var cost = (DIFFKEY === 2) ? 3 : 2;                     // 简单/困难 -2，地狱 -3
+  var deduct = Math.min(cost, arr[0]);                    // 耐久不足也能强行开门，扣掉剩余耐久
+  arr[0] -= deduct;
+  if (arr[0] <= 0) { arr.shift(); player.consumedValue += (CARD_PRICES[h.lv] || 0); }   // 耐久耗尽 → 该卡作废，计入战损
+  openKeyHouse(h);
+}
+
+// 每帧构建房卡房门的点击交互（点击或按 V 开门）
+function updateDoors() {
+  worldBtns = [];
+  if (funMode) return;
+  var p = player;
+  for (var i = 0; i < keyHouses.length; i++) {
+    var h = keyHouses[i];
+    if (h.opened) continue;
+    if (Math.abs((p.x + p.w / 2) - h.x) < 60 && Math.abs((p.y + p.h) - h.y) < 80) {
+      nearDoor = h;
+      worldBtns.push({ r: [VW / 2 - 96, VH - 100, 192, 40], cb: (function (hh) { return function () { tryOpenDoor(hh); }; })(h) });
+      return;
+    }
+  }
+  nearDoor = null;
+}
+var nearDoor = null;
+
+/* ===================== 背包 / 仓库 ===================== */
+// 武器栏槽 i 的枪卸下：有背包则入背包储物，否则丢到地面
+function barUnload(i) {
+  var wk = player.bar[i]; if (!wk) return;
+  if (bagCap() > 0 && player.bag.length < bagCap()) player.bag.push(wk);
+  else drops.push({ type: 'gun', gun: wk, mag: player.mag[wk], x: player.x, y: player.y + 10, w: 26, h: 12, t: 0, vy: 0, gold: false });
+  player.bar[i] = null;
+  if (player.wp === wk) pickActiveWp();
+  SFX.toss();
+}
+// 背包里的枪装入武器栏（类型匹配 + 空闲槽）
+function bagToBar(gk) {
+  var i = player.bag.indexOf(gk); if (i < 0) return;
+  var slot = freeBarSlot(gunKind(gk)); if (slot < 0) return;
+  player.bag.splice(i, 1);
+  player.bar[slot] = gk; player.wp = gk; player.noGun = false;
+  SFX.pick();
+}
+// 丢弃背包里的枪到地面
+function bagDrop(gk) {
+  var i = player.bag.indexOf(gk); if (i < 0) return;
+  drops.push({ type: 'gun', gun: gk, mag: player.mag[gk], x: player.x, y: player.y + 10, w: 26, h: 12, t: 0, vy: 0, gold: false });
+  player.bag.splice(i, 1);
+  SFX.toss();
+}
+function bagSellGren() { if (player.grens > 0) { player.grens--; player.coins += SHOP_PRICES.grenade; SFX.pick(); } }
+function bagSellHealth() { if (player.healthPacks > 0) { player.healthPacks--; player.coins += SHOP_PRICES.health; SFX.pick(); } }
+function bagSellSell(lv) { var c = player.sell[lv] || 0; if (c > 0) { player.sell[lv] = 0; player.coins += sellVal(lv) * c; SFX.pick(); } }
+// 背包里的收集物：变卖（按等级价值换金币）/ 丢弃
+function bagSellItem(idx) {
+  if (!player.items || idx < 0 || idx >= player.items.length) return;
+  var it = player.items[idx]; if (!it) return;
+  player.coins += itemVal(it.tier); player.items.splice(idx, 1); SFX.pick();
+}
+function bagDropItem(idx) {
+  if (!player.items || idx < 0 || idx >= player.items.length) return;
+  var it = player.items[idx]; if (!it) return;
+  drops.push({ type: 'item', tier: it.tier, x: player.x, y: player.y + 10, w: 14, h: 14, t: 0, vy: 0 });
+  player.items.splice(idx, 1); SFX.toss();
+}
+function whDepositGun(wk) {
+  var bi = player.bar.indexOf(wk), gi = player.bag.indexOf(wk);
+  if (bi < 0 && gi < 0) return;
+  if (bi >= 0) { player.bar[bi] = null; if (player.wp === wk) pickActiveWp(); }
+  else player.bag.splice(gi, 1);
+  warehouse.guns.push(wk); SFX.pick();
+}
+function whWithdrawGun(idx) {
+  if (idx < 0 || idx >= warehouse.guns.length) return;
+  var wk = warehouse.guns[idx];
+  if (!canCarry(wk)) return;   // 武器栏与背包都无空位
+  warehouse.guns.splice(idx, 1);
+  var k = gunKind(wk), slot = freeBarSlot(k);
+  if (slot >= 0) { player.bar[slot] = wk; player.wp = wk; player.noGun = false; }
+  else { player.bag.push(wk); }
+  SFX.pick();
+}
+function whDepositSell(lv) { var c = player.sell[lv] || 0; if (c > 0) { warehouse.sell[lv] = (warehouse.sell[lv] || 0) + c; player.sell[lv] = 0; SFX.pick(); } }
+function whWithdrawSell(lv) { var c = warehouse.sell[lv] || 0; if (c > 0) { player.sell[lv] = (player.sell[lv] || 0) + c; warehouse.sell[lv] = 0; SFX.pick(); } }
+// 仓库右键卖出：把仓库内武器/变卖物直接换成金币（变卖物按等级单价结算）
+function whSellGun(wk) {
+  var bi = warehouse.guns.indexOf(wk); if (bi < 0) return;
+  warehouse.guns.splice(bi, 1); player.coins += gunVal(wk); SFX.pick();
+}
+function whSellSell(lv) {
+  var c = warehouse.sell[lv] || 0; if (c > 0) { warehouse.sell[lv] = 0; player.coins += sellVal(lv) * c; SFX.pick(); }
+}
+// 持有中武器右键卖出（仓库左侧「当前持有」）
+function sellOwnedGun(wk) {
+  var bi = player.bar.indexOf(wk), gi = player.bag.indexOf(wk);
+  if (bi < 0 && gi < 0) return;
+  if (bi >= 0) { player.bar[bi] = null; if (player.wp === wk) pickActiveWp(); }
+  else player.bag.splice(gi, 1);
+  player.coins += gunVal(wk); SFX.pick();
+}
+
+function drawBag() {
+  bagBtns = [];
+  ctx.fillStyle = 'rgba(6,12,8,0.86)'; ctx.fillRect(0, 0, VW, VH);
+  txt('背 包（E 或 ESC 关闭）', VW / 2, 28, TH.gold, 24, 'center');
+  txt('金币 ' + player.coins + '　背包等级 ' + player.bagLv + '/6（武器 ' + player.bag.length + '/' + bagCap() + '　收集物 ' + player.items.length + '/' + ITEM_CAP + '）　房卡 ' +
+    cardTotal() + ' 张　卡包 ' + cardPackTotal() + '/' + CARD_PACK_CAP + '　词条书 紫×' + player.books[4] + ' 金×' + player.books[5] + ' 红×' + player.books[6], VW / 2, 52, TH.white, 13, 'center');
+  txt('提示：武器栏才能用，背包里的枪需【装入】武器栏；手枪位只放手枪，主武器位只放主武器', VW / 2, 70, '#9fc08a', 12, 'center');
+
+  var lx = 24, lw = 700;
+  // 武器栏（3 槽，类型锁定）
+  txt('— 武器栏（按 1/2/3 切换使用）—', lx, 92, TH.accent, 15);
+  var y = 102;
+  for (var i = 0; i < MAX_BAR; i++) {
+    var kind = barSlotType(i);
+    var wk = player.bar[i];
+    var af = gunAffixOf(wk);
+    var afSuf = af ? ('　[词条 +' + Math.round(af.dmg * 100) + '%伤 +' + Math.round(af.rate * 100) + '%射]') : '';
+    if (player.bulletTier[wk] === 2) afSuf += '　[二级弹 ×1.5]';
+    rr(lx, y, lw, 34, wk ? (player.wp === wk ? '#16331c' : '#102014') : '#0e1810');
+    txt((i + 1) + '. ' + (kind === 'pistol' ? '手枪位' : '主武器位') + (wk ? '：' + WEAPONS[wk].name : '（空）') + (wk && player.wp === wk ? ' ★使用中' : '') + afSuf,
+      lx + 8, y + 22, wk ? (player.wp === wk ? TH.green : '#cfe0bc') : '#5a6a52', 14);
+    if (wk) {
+      var hasBook = player.books[4] + player.books[5] + player.books[6] > 0;
+      // 设为当前
+      (function (wk2) { bagBtns.push({ r: [lx + lw - 300, y + 4, 92, 26], cb: function () { player.wp = wk2; player.noGun = false; } }); })(wk);
+      rr(lx + lw - 300, y + 4, 92, 26, '#244'); txt('设为当前', lx + lw - 254, y + 21, '#bdf', 12, 'center');
+      // 卸下（进背包或丢地）
+      (function (i2) { bagBtns.push({ r: [lx + lw - 202, y + 4, 92, 26], cb: function () { barUnload(i2); } }); })(i);
+      rr(lx + lw - 202, y + 4, 92, 26, '#422'); txt('卸下', lx + lw - 156, y + 21, '#fbb', 12, 'center');
+      // 入仓
+      (function (wk2) { bagBtns.push({ r: [lx + lw - 104, y + 4, 92, 26], cb: function () { whDepositGun(wk2); } }); })(wk);
+      rr(lx + lw - 104, y + 4, 92, 26, '#242'); txt('入仓', lx + lw - 58, y + 21, '#bdf', 12, 'center');
+      // 附魔（用最高级词条书强化该枪，可叠加；需持有词条书）
+      if (hasBook) {
+        (function (wk2) { bagBtns.push({ r: [lx + 270, y + 4, 118, 26], cb: function () { applyBookBest(wk2); } }); })(wk);
+        rr(lx + 270, y + 4, 118, 26, '#3a2a4a'); txt('附魔（用词条书）', lx + 329, y + 21, '#d9b0ff', 12, 'center');
+      }
+    }
+    y += 38;
+  }
+  // 背包（储物）
+  y += 4;
+  if (player.bagLv > 0) {
+    txt('— 武器背包（储物 ' + player.bag.length + '/' + bagCap() + ' · 枪不能上场，需装入武器栏）—', lx, y + 4, TH.accent, 15); y += 22;
+    if (player.bag.length === 0) { txt('（空）', lx + 8, y + 14, '#888', 13); y += 26; }
+    for (var bi = 0; bi < player.bag.length; bi++) {
+      var bwk = player.bag[bi], bw = WEAPONS[bwk], baf = gunAffixOf(bwk);
+      var bafSuf = baf ? ('　[+' + Math.round(baf.dmg * 100) + '%伤/+' + Math.round(baf.rate * 100) + '%射]') : '';
+      if (player.bulletTier[bwk] === 2) bafSuf += '　[二级弹 ×1.5]';
+      rr(lx, y, lw, 30, '#102014');
+      txt(bw.name + '（' + (bw.kind === 'pistol' ? '手枪' : '主武器') + '）' + bafSuf, lx + 8, y + 20, '#cfe0bc', 13);
+      var bHasBook = player.books[4] + player.books[5] + player.books[6] > 0;
+      (function (wk2) { bagBtns.push({ r: [lx + lw - 300, y + 3, 92, 24], cb: function () { bagToBar(wk2); } }); })(bwk);
+      rr(lx + lw - 300, y + 3, 92, 24, '#244'); txt('装入栏', lx + lw - 254, y + 19, '#bdf', 12, 'center');
+      if (bHasBook) {
+        (function (wk2) { bagBtns.push({ r: [lx + 270, y + 3, 118, 24], cb: function () { applyBookBest(wk2); } }); })(bwk);
+        rr(lx + 270, y + 3, 118, 24, '#3a2a4a'); txt('附魔', lx + 329, y + 19, '#d9b0ff', 12, 'center');
+      }
+      (function (wk2) { bagBtns.push({ r: [lx + lw - 202, y + 3, 92, 24], cb: function () { bagDrop(wk2); } }); })(bwk);
+      rr(lx + lw - 202, y + 3, 92, 24, '#422'); txt('丢弃', lx + lw - 156, y + 19, '#fbb', 12, 'center');
+      (function (wk2) { bagBtns.push({ r: [lx + lw - 104, y + 3, 92, 24], cb: function () { whDepositGun(wk2); } }); })(bwk);
+      rr(lx + lw - 104, y + 3, 92, 24, '#242'); txt('入仓', lx + lw - 58, y + 19, '#bdf', 12, 'center');
+      y += 34;
+    }
+    // 背包中的收集物（每色对应一个实物，占 1 格，可变卖）
+    var itCount = player.items ? player.items.length : 0;
+    if (itCount > 0) {
+      for (var ii = 0; ii < itCount; ii++) {
+        var it = player.items[ii];
+        rr(lx, y, lw, 28, '#102014');
+        drawLootIcon(it.tier, lx + 14, y + 14);               // 对应实物图标 + 该色光芒
+        txt((ITEM_DEFS[it.tier] ? ITEM_DEFS[it.tier].name : TIER_NAMES[it.tier]) + '（价值 ' + itemVal(it.tier) + ' 金）', lx + 28, y + 18, '#cfe0bc', 13);
+        (function (idx) { bagBtns.push({ r: [lx + lw - 300, y + 3, 92, 22], cb: function () { bagSellItem(idx); } }); })(ii);
+        rr(lx + lw - 300, y + 3, 92, 22, '#422'); txt('变卖 (+' + itemVal(it.tier) + ')', lx + lw - 254, y + 18, '#fbb', 12, 'center');
+        (function (idx) { bagBtns.push({ r: [lx + lw - 202, y + 3, 92, 22], cb: function () { bagDropItem(idx); } }); })(ii);
+        rr(lx + lw - 202, y + 3, 92, 22, '#422'); txt('丢弃', lx + lw - 156, y + 18, '#fbb', 12, 'center');
+        y += 32;
+      }
+    } else {
+      txt('（背包中暂无收集物）', lx + 8, y + 14, '#888', 13); y += 24;
+    }
+  } else {
+    txt('— 背包（未购买：在商城购买背包后可储物，容量 = 等级）—', lx, y + 4, TH.accent, 15); y += 22;
+    txt('（无背包时只能直接装备武器栏的 3 把枪）', lx + 8, y + 14, '#888', 13); y += 26;
+  }
+  // 消耗品
+  y += 4;
+  txt('— 消耗品（可卖回原价）—', lx, y + 4, TH.accent, 15); y += 22;
+  rr(lx, y, lw, 26, '#102014');
+  txt('手雷 ×' + player.grens + '/' + GREN_CAP + '（卖价 ' + SHOP_PRICES.grenade + ' 金）', lx + 8, y + 18, '#cfe0bc', 13);
+  bagBtns.push({ r: [lx + lw - 150, y + 2, 140, 22], cb: bagSellGren });
+  rr(lx + lw - 150, y + 2, 140, 22, '#422'); txt('卖 1 个 (+' + SHOP_PRICES.grenade + ')', lx + lw - 80, y + 17, '#fbb', 12, 'center');
+  y += 30;
+  rr(lx, y, lw, 26, '#102014');
+  txt('血包 ×' + player.healthPacks + '/' + MAX_HEALTHPACKS + '（卖价 ' + SHOP_PRICES.health + ' 金）', lx + 8, y + 18, '#cfe0bc', 13);
+  bagBtns.push({ r: [lx + lw - 150, y + 2, 140, 22], cb: bagSellHealth });
+  rr(lx + lw - 150, y + 2, 140, 22, '#422'); txt('卖 1 个 (+' + SHOP_PRICES.health + ')', lx + lw - 80, y + 17, '#fbb', 12, 'center');
+  y += 30;
+  // 变卖物
+  txt('— 变卖物（卖出换金币 / 入仓）—', lx, y + 4, TH.accent, 15); y += 22;
+  var anySell = false;
+  for (var lv = 1; lv <= 6; lv++) {
+    var cnt = player.sell[lv] || 0; if (cnt <= 0) continue;
+    anySell = true; var val = sellVal(lv);
+    rr(lx, y, lw, 24, '#102014');
+    rr(lx + 4, y + 4, 16, 16, cardCol(lv));
+    txt('Lv' + lv + ' 变卖物 ×' + cnt + '（单价 ' + val + ' 金）', lx + 26, y + 16, '#cfe0bc', 13);
+    (function (lv2) { bagBtns.push({ r: [lx + lw - 232, y + 1, 112, 22], cb: function () { bagSellSell(lv2); } }); })(lv);
+    rr(lx + lw - 232, y + 1, 112, 22, '#422'); txt('全卖 (+' + (val * cnt) + ')', lx + lw - 176, y + 16, '#fbb', 12, 'center');
+    (function (lv2) { bagBtns.push({ r: [lx + lw - 116, y + 1, 108, 22], cb: function () { whDepositSell(lv2); } }); })(lv);
+    rr(lx + lw - 116, y + 1, 108, 22, '#242'); txt('入仓', lx + lw - 62, y + 16, '#bdf', 12, 'center');
+    y += 28;
+  }
+  if (!anySell) { txt('（空）', lx + 8, y + 14, '#888', 13); y += 24; }
+  // 战损与捡取收益
+  y += 6;
+  rr(lx, y, lw, 26, '#1a1410');
+  rr(lx, y, 4, 26, '#a05a3a');
+  txt('战损（已消耗价值）：' + Math.round(player.consumedValue) + ' 金', lx + 12, y + 17, '#e8b08a', 13);
+  txt('捡取收益（吃的钱）：' + player.lootedValue + ' 金', lx + 330, y + 17, '#8ad0e0', 13);
+  y += 32;
+  txt('仓库请在【商城】左下角「仓库」按钮打开', VW / 2, VH - 16, '#8fa07a', 12, 'center');
+}
+
+/* ===================== 娱乐关卡（垂直爬山跑酷） ===================== */
+function genFunWorld(lv) {
+  TH = Object.assign({}, BASE, FUN_THEME);
+  var W = Math.max(4, Math.round(12 - lv * 0.9));                       // 平台宽度：12 → 4（越窄越难落脚）
+  var gapV = 5 + Math.floor(lv * 0.45);                                // 平台间垂直落差：5 → 9 行（越高越难爬、摔得越狠）
+  var offH = Math.max(1, Math.min(W - 2, 1 + Math.floor(lv * 0.4)));   // 水平错位（恒 < 平台宽，保证与下台重叠可架梯）
+  var nP = 10;
+  var rise = 3 + gapV * (nP - 1);
+  ROWS = rise + 6; WORLD_H = ROWS * TILE;             // 世界随难度变高
+  COLS = 48; WORLD_W = COLS * TILE;
+  tiles = new Uint8Array(COLS * ROWS);
+  hm = new Array(COLS).fill(0);
+  ladders = []; redFlags = []; respawnFlag = null; keyHouses = []; houseCrates = {}; funPlats = []; extractFlag = null;
+  var floorRow = ROWS - 3;
+  for (var c = 0; c < COLS; c++) { hm[c] = floorRow; for (var r = floorRow; r < ROWS; r++) tiles[r * COLS + c] = 1; }
+  function plat(c0, row, w) { for (var i = 0; i < w; i++) tiles[row * COLS + (c0 + i)] = 2; }
+  var plats = [];
+  var col = 6, row = floorRow - 3, dir = 1;
+  for (var k = 0; k < nP; k++) {
+    col = Math.max(2, Math.min(COLS - W - 2, col));
+    plat(col, row, W);
+    plats.push({ c: col, r: row, w: W });
+    if (k < nP - 1) {
+      var ncol = col + offH * dir;
+      if (ncol < 2 || ncol + W > COLS - 2) { dir *= -1; ncol = col + offH * dir; }
+      ncol = Math.max(2, Math.min(COLS - W - 2, ncol));
+      var lo = Math.max(col, ncol), hi = Math.min(col + W - 1, ncol + W - 1);
+      var lc = Math.floor((lo + hi) / 2);              // 重叠区正中架梯，两端平台都够得着
+      ladders.push({ c: lc, top: row - gapV, bot: row });
+      col = ncol; row = row - gapV;
+    }
+  }
+  funPlats = plats;
+  var topP = plats[plats.length - 1];
+  flag = { x: (topP.c + Math.floor(topP.w / 2)) * TILE + 10, y: topP.r * TILE, h: 70 };
+  rope = null; plane = null;
+  spawn = { x: (plats[0].c + 2) * TILE, y: (floorRow - 2) * TILE };
+  funGoalX = 0;
+  funGoalY = topP.r * TILE;                            // 到达顶端平台即胜利
+}
+function spawnFunEnemies(lv) {
+  enemies = [];
+  var floorRow = ROWS - 3;
+  var types = [0, 2, 1, 4, 2, 5, 1, 4, 2, 0];         // 敌方实力恒定（不随难度变化）
+  for (var i = 1; i < funPlats.length; i++) {
+    var p = funPlats[i];
+    var t = ETYPES[types[i % types.length]];
+    enemies.push(makeEnemy(t, (p.c + 1) * TILE, p.r * TILE - 38));
+  }
+  // 地面上的少量敌人
+  enemies.push(makeEnemy(ETYPES[0], 60, floorRow * TILE - 38));
+  enemies.push(makeEnemy(ETYPES[1], 200, floorRow * TILE - 38));
+}
+
+function startFunGame(weapon, lv) {
+  funSelLevel = (typeof lv === 'number') ? lv : 0;
+  funMode = true;
+  funWeapon = weapon;
+  DIFF = DIFFS[0];          // 娱乐关卡恒为简单
+  LS = 1;
+  genFunWorld(funSelLevel);
+  player = newPlayer();
+  // 自选武器，备弹充足
+  player.bar = [null, null, null];
+  if (gunKind(weapon) === 'pistol') player.bar[BAR_PISTOL] = weapon; else player.bar[BAR_PRIM1] = weapon;
+  player.wp = weapon;
+  player.mag = { pistol: 0, shotgun: 0, mg: 0, rocket: 0, urocket: 0, bounce: 0 };
+  player.mag[weapon] = WEAPONS[weapon].mag;
+  player.reserve = 600;
+  player.grens = 10000;
+  spawnFunEnemies(funSelLevel);
+  bullets = []; ebullets = []; grens = []; drops = []; parts = []; corpses = [];
+  cam.x = 0; cam.y = WORLD_H - VH; holdTimer = 0; ropeReady = false; elapsed = 0; shake = 0; grenAiming = false;
+  stats = { kills: 0, deaths: 0, killStreak: 0, shots: 0 };
+  state = 'play';
+  bannerT = 2600; bannerText = '娱乐关卡 · 第 ' + (funSelLevel + 1) + ' 阶 · ' + FUN_LEVELS[funSelLevel].name + ' · ' + WEAPONS[weapon].name;
+}
+
+/* ===================== 更新 ===================== */
+function update(dt) {
+  elapsed += dt;
+  if (shake > 0) shake -= dt * 0.03;
+  if (shake < 0) shake = 0;
+  if (bannerT > 0) bannerT -= dt;
+  updateWorld(dt);
+  if (just['Escape'] && state === 'play') state = 'pause';
+  else if (just['Escape'] && state === 'pause') state = 'play';
+}
+
+function updateWorld(dt) {
+  var p = player;
+
+  if (p.dead) {
+    p.deadT += dt;
+    var canRevive = funMode || player.reviveCoins > 0 || player.coins >= RESPAWN_COST;
+    // 死亡动画期间点击：立刻弹出复活菜单（或没钱时直接结算），避免点击被“吃掉”显得点不动
+    if (mouse.click && p.deadT > 300) {
+      mouse.click = false;   // 消费该次点击，避免同一帧又触发菜单按钮
+      if (funMode) respawn();
+      else if (canRevive) state = 'dead';
+      else { resultInfo = { win: false, final: false, time: Math.round(elapsed / 1000), kills: stats.kills, deaths: stats.deaths }; state = 'result'; }
+    } else if (p.deadT > 1400) {
+      if (funMode) { respawn(); }                 // 跑酷：免费自动复活
+      else if (canRevive) { state = 'dead'; }     // 战役：弹复活选项
+      else { resultInfo = { win: false, final: false, time: Math.round(elapsed / 1000), kills: stats.kills, deaths: stats.deaths }; state = 'result'; }  // 没钱复活 → 直接嘎屁
+    }
+    stepProjectiles(dt); stepParticles(dt);
+    return;
+  }
+
+  /* --- 噪音 --- */
+  var moving = false, noiseTarget = 0;
+  var sprint = !p.onLadder && p.onGround && !p.crouch && !keys['KeyS'] && (keys['ShiftLeft'] || keys['ShiftRight']) && (keys['KeyA'] || keys['KeyD']);
+  if (p.onLadder) noiseTarget = 0.15;
+  else if (sprint) { moving = true; noiseTarget = 1.8; }            // 疾跑：噪音极大
+  else if (keys['KeyA'] || keys['KeyD']) { moving = true; noiseTarget = p.crouch ? 0.3 : 1; }
+  else if (p.crouch) noiseTarget = 0;   // 蹲着不动：无噪音
+  else noiseTarget = 0;                  // 站立不动：无噪音（潜行关键）
+  p.noise += (noiseTarget - p.noise) * Math.min(1, dt / 120);
+  p.sprint = !!sprint;
+  var hearR = 60 + p.noise * 300 * DIFF.hearMul;
+
+  /* --- 左右移动 --- */
+  if (!p.onLadder) {
+    var baseSpd = p.crouch ? 1.15 : 2.75;
+    var spd = sprint ? 4.4 : baseSpd;
+    if (!p.onGround) spd = Math.max(spd, 3.9);   // 空中水平速度提升 → 跳跃距离更长
+    if (keys['KeyA']) { p.vx = -spd; p.face = -1; }
+    else if (keys['KeyD']) { p.vx = spd; p.face = 1; }
+    else p.vx *= 0.7;
+    if (Math.abs(p.vx) < 0.05) p.vx = 0;
+  } else p.vx = 0;
+
+  /* --- 下蹲 --- */
+  var wantCrouch = !!keys['KeyS'] && p.onGround && !p.onLadder;
+  if (wantCrouch && !p.crouch) { p.y += 14; p.h = 24; p.crouch = true; }
+  else if (!wantCrouch && p.crouch) {
+    p.y -= 14; p.h = 38; p.crouch = false;
+    if (solidAt(Math.floor((p.x + p.w / 2) / TILE), Math.floor((p.y + p.h / 2) / TILE))) { p.y += 14; p.h = 24; p.crouch = true; }
+  }
+  if (!p.onLadder) p.face = (mouse.x + cam.x) > (p.x + p.w / 2) ? 1 : -1;
+
+  /* --- 梯子 / 绳梯 --- */
+  if (just['Space']) {
+    if (p.onLadder) { p.onLadder = null; }
+    else {
+      var L = nearLadder(p);
+      if (L) { p.onLadder = L; p.vy = 0; }
+      else if (ropeReady && nearRope(p)) { p.onLadder = { rope: true }; p.vy = 0; }
+    }
+  }
+  if (p.onLadder) {
+    p.vy = 0; p.climbT += dt;
+    var L2 = p.onLadder;
+    if (L2.rope) {
+      p.x += (rope.x - 6 - p.x) * 0.3;
+      if (keys['KeyW']) p.y -= 2.6;
+      if (keys['KeyS']) p.y += 2.6;
+      if (p.y < rope.top + 10) { winGame(); return; }
+      if (p.y > rope.bot) { p.onLadder = null; }
+    } else {
+      p.x += (L2.c * TILE + 1 - p.x) * 0.3;
+      if (keys['KeyW']) p.y -= 2.4;
+      if (keys['KeyS']) p.y += 2.4;
+      if (p.y + p.h < L2.top * TILE + 6) { p.onLadder = null; }
+      if (p.y > L2.bot * TILE) { p.onLadder = null; }
+    }
+  } else {
+    p.vy += 0.62;
+    if (p.vy > 15) p.vy = 15;
+    if (just['KeyW'] && p.onGround) { p.vy = -13.6; p.onGround = false; }   // 跳得更高、更远
+  }
+
+  /* --- 落坑 --- */
+  if (p.y > WORLD_H + 80) { hurtPlayer(999); }
+
+  /* --- 娱乐关卡：爬到顶端即胜利（垂直） --- */
+  if (funMode && !p.dead && p.y < funGoalY) { winGame(); return; }
+
+  var wasGround = p.onGround;
+  p.onGround = false;
+  var intendVx = p.vx;
+  var blockedX = moveX(p, p.vx);
+  if (blockedX && wasGround && p.vy >= 0) {
+    var sx = p.x, sy = p.y, climbed = false;
+    for (var s = 1; s <= 3; s++) {
+      p.x = sx; p.y = sy - s * TILE;
+      if (!overlapSolid(p) && !moveX(p, intendVx)) { climbed = true; break; }
+    }
+    if (!climbed) { p.x = sx; p.y = sy; }
+  }
+  moveY(p, p.vy);
+
+  if (moving && p.onGround) { p.walk += Math.abs(p.vx) * 0.18; if (Math.random() < 0.06) puff(p.x + p.w / 2, p.y + p.h, 1, TH.dirtDark, 0.6); }
+
+  /* --- 换弹 / 射击 --- */
+  if (p.reloadT > 0) { p.reloadT -= dt; if (p.reloadT <= 0) { p.reloadT = 0; finishReload(); } }
+  if (p.fireT > 0) p.fireT -= dt;
+  if (p.hurtT > 0) p.hurtT -= dt;
+  if (p.invuln > 0) p.invuln -= dt;
+
+  var w = WEAPONS[p.wp];
+  mouseJust = mouse.down && !lastMouseDown;
+  if (mouse.down && p.fireT <= 0 && p.reloadT <= 0 && !p.onLadder && (w.auto || mouseJust)) playerShoot();
+  if (just['KeyR']) tryReload();
+  if (w.autoReload && p.mag[p.wp] < (w.volley ? w.volley : 1) && p.reloadT <= 0 && !p.noGun && p.reserve > 0) tryReload();   // RPG / 超级火箭炮 自动换弹
+  if (just['KeyQ']) dropWeapon();
+  if (just['Digit1'] && p.bar[0]) { p.wp = p.bar[0]; p.noGun = false; }
+  if (just['Digit2'] && p.bar[1]) { p.wp = p.bar[1]; p.noGun = false; }
+  if (just['Digit3'] && p.bar[2]) { p.wp = p.bar[2]; p.noGun = false; }
+  if (just['KeyF']) {
+    if (!p.hasRig) { bannerText = '没有胸挂，无法使用血包'; bannerT = 1200; }
+    else if (p.healthPacks > 0 && p.hp < p.maxHp) { p.healthPacks--; p.hp = Math.min(p.maxHp, p.hp + 700); p.consumedValue += SHOP_PRICES.health; SFX.pick(); }
+  }
+  if (just['KeyB'] && !funMode) openShopPause();
+  if (just['KeyE'] && !funMode) { state = 'bag'; return; }   // 打开背包/仓库界面
+  if (just['KeyH'] && !funMode) tryOpenBox();                // 开死亡木盒捡回装备
+  if (just['KeyV'] && !funMode && nearDoor) tryOpenDoor(nearDoor);   // 用卡包开门（消耗耐久）
+  if (mouse.rclick) { tryPickup(); mouse.rclick = false; }
+
+  /* --- 东端目标旗坚守（仅普通战役） --- */
+  if (!funMode) {
+    var dflag = Math.abs((p.x + p.w / 2) - flag.x);
+    if (!ropeReady && dflag < 80) {
+      holdTimer += dt;
+      if (holdTimer >= 10000) {
+        ropeReady = true; rope.active = true;
+        SFX.win();
+      }
+    } else if (!ropeReady) holdTimer = Math.max(0, holdTimer - dt * 0.5);
+  }
+
+  /* --- 红旗：战役模式为固定据点，站 5 秒夺取为复活点；未夺取时持续刷敌 --- */
+  if (!funMode) {
+    for (var fi = 0; fi < redFlags.length; fi++) {
+      var rf = redFlags[fi];
+      var onF = Math.abs((p.x + p.w / 2) - rf.x) < 30 && Math.abs((p.y + p.h) - rf.y) < 16 && p.onGround && !p.onLadder;
+      if (!rf.captured) {
+        if (onF) {
+          rf.holdT += dt;
+          if (rf.holdT >= 5000) {
+            for (var fk = 0; fk < redFlags.length; fk++) redFlags[fk].captured = false;   // 同时仅一面生效
+            rf.captured = true;
+            respawnFlag = rf;
+            player.respawn = { x: rf.x - p.w / 2 + 2, y: rf.y - p.h };
+            SFX.setpt();
+          }
+        } else {
+          rf.holdT = Math.max(0, rf.holdT - dt * 0.6);
+          rf.spawnT += dt;
+          if (rf.spawnT >= 1800) {                 // 未夺取时每 1.8s 刷一个敌兵
+            rf.spawnT -= 1800;
+            if (enemies.length < 60) spawnRandomEnemy(rf.x, rf.y - 16);
+          }
+        }
+      }
+    }
+    // 撤离点进攻红旗：每 10 秒召唤一个随机敌兵（不含抢旗手）
+    if (extractFlag) {
+      extractFlag.spawnT += dt;
+      if (extractFlag.spawnT >= 10000) {
+        extractFlag.spawnT -= 10000;
+        if (enemies.length < 60) spawnRandomEnemy(extractFlag.x, extractFlag.y - 16);
+      }
+    }
+  } else {
+    /* --- 跑酷模式：保留原来的“跟随玩家”红旗刷敌 --- */
+    var rp = respawnPoint();
+    var rfx = Math.min(WORLD_W - 30, rp.x + RED_FLAG_DX);
+    var rfc = Math.floor(rfx / TILE);
+    var rfy = (rfc >= 0 && rfc < COLS ? hm[rfc] : rp.y) * TILE;
+    redFlag.x = rfx; redFlag.y = rfy;
+    var atPoint = Math.abs((p.x + p.w / 2) - rp.x) < RED_FLAG_R && Math.abs((p.y + p.h) - rp.y) < RED_FLAG_R;
+    redFlag.active = !atPoint && !p.dead;
+    if (redFlag.active) {
+      redSpawnT += dt;
+      if (redSpawnT >= 1000) {
+        redSpawnT -= 1000;
+        if (enemies.length < 60) spawnRandomEnemy(redFlag.x, redFlag.y);
+      }
+    } else {
+      redSpawnT = 0;
+    }
+  }
+
+  /* --- 敌人 --- */
+  for (var i = enemies.length - 1; i >= 0; i--) {
+    var e = enemies[i];
+    if (e.dead) {
+      e.deadT += dt;
+      if (e.deadT > 2600) enemies.splice(i, 1);
+      continue;
+    }
+    e.hurtT = Math.max(0, e.hurtT - dt);
+    var ex = e.x + e.w / 2 - (p.x + p.w / 2), ey = e.y + e.h / 2 - (p.y + p.h / 2);
+    var dist = Math.sqrt(ex * ex + ey * ey);
+
+    var detectR = DIFF.detectM * TILE;
+    if (detectR > 0 && dist < detectR && hasLOS(p.x + p.w / 2, p.y + p.h / 2, e.x + e.w / 2, e.y + e.h / 2)) {
+      e.alert = true; e.alertT = DIFF.alertT;
+    }
+    if (!e.alert && dist < hearR) { e.alert = true; e.alertT = DIFF.alertT; }
+    if (e.alert) {
+      e.alertT -= dt;
+      if (dist > 900 || e.alertT <= 0) e.alert = false;
+    }
+
+    if (e.t.stealer && respawnFlag) {
+      // 抢旗手：有激活重生点时，不攻击玩家，径直冲向旗并读条摧毁
+      var dxf = respawnFlag.x - (e.x + e.w / 2);
+      e.face = dxf < 0 ? -1 : 1;
+      if (Math.abs(dxf) > 26) {
+        e.vx = e.face * e.t.speed * DIFF.espeed * ENEMY_SPEED_MUL;
+      } else {
+        e.vx = 0;
+        e.stealT += dt;
+        if (e.stealT >= STEAL_TIME) {
+          respawnFlag.captured = false; respawnFlag.holdT = 0;   // 敌人夺回红旗，复活点失效
+          player.respawn = null;
+          respawnFlag = null;
+          e.stealT = 0;
+          SFX.crate();
+        }
+      }
+    } else if (e.alert) {
+      e.face = ex < 0 ? 1 : -1;
+      if (dist > e.t.range * 0.55) e.vx = e.face * e.t.speed * DIFF.espeed * ENEMY_SPEED_MUL;
+      else if (dist < 60) e.vx = -e.face * e.t.speed * 0.5 * DIFF.espeed * ENEMY_SPEED_MUL;
+      else e.vx = 0;
+      e.fireT -= dt;
+      if (e.fireT <= 0 && dist < e.t.range) { enemyShoot(e); e.fireT = e.t.rate * (0.8 + Math.random() * 0.4); }
+    } else {
+      e.patrol -= dt;
+      if (e.patrol <= 0) { e.dir *= -1; e.patrol = 1200 + Math.random() * 2200; }
+      e.vx = e.dir * e.t.speed * 0.45 * DIFF.espeed * ENEMY_SPEED_MUL;
+      e.face = e.dir;
+    }
+    e.vy += 0.62; if (e.vy > 15) e.vy = 15;
+    e.onGround = false;
+    var bx0 = e.x;
+    moveX(e, e.vx);
+    var blockedX2 = Math.abs(e.x - (bx0 + e.vx)) > 0.5;
+    moveY(e, e.vy);
+    if (blockedX2) {
+      if (!e.alert) e.dir *= -1;
+      else if (e.onGround) e.vy = -9;
+    }
+    if (e.y > WORLD_H + 80) hurtEnemy(e, 9999, true);
+    if (Math.abs(e.vx) > 0.1) e.walk += Math.abs(e.vx) * 0.2;
+    if (dist < 22 && !p.dead) hurtPlayer(Math.round(3 * ENEMY_DMG_MUL));
+  }
+
+  stepProjectiles(dt);
+  stepParticles(dt);
+  stepDrops(dt);
+
+  if (funMode) {
+    cam.y += ((p.y + p.h / 2 - VH / 2) - cam.y) * 0.12;
+    if (cam.y < 0) cam.y = 0;
+    if (cam.y > WORLD_H - VH) cam.y = WORLD_H - VH;
+  } else {
+    cam.x += ((p.x + p.w / 2 - VW / 2) - cam.x) * 0.12;
+    if (cam.x < 0) cam.x = 0;
+    if (cam.x > WORLD_W - VW) cam.x = WORLD_W - VW;
+    if (cam.y !== 0) cam.y = 0;
+  }
+
+  updateDoors();
+  updateDeathBoxes();
+}
+
+var lastMouseDown = false, mouseJust = false;
+
+function nearLadder(p) {
+  var py = p.y + p.h / 2;
+  for (var i = 0; i < ladders.length; i++) {
+    var L = ladders[i];
+    if (Math.abs((L.c * TILE + 10) - (p.x + p.w / 2)) < 20 && py > L.top * TILE - 10 && py < L.bot * TILE + 20) return L;
+  }
+  return null;
+}
+function nearRope(p) {
+  var py = p.y + p.h / 2;
+  return Math.abs(rope.x - (p.x + p.w / 2)) < 26 && py > rope.top - 10 && py < rope.bot + 30;
+}
+
+function stepProjectiles(dt) {
+  var i, b;
+  for (i = bullets.length - 1; i >= 0; i--) {
+    b = bullets[i];
+    var bx0 = b.x, by0 = b.y;
+    b.x += b.vx; b.y += b.vy; b.life--;
+    var c = Math.floor(b.x / TILE), r = Math.floor(b.y / TILE);
+    var tHit = tileAt(c, r);
+    var consumed = false, doExplode = false;
+    var isBouncer = !!b.splash;
+    // 命中敌人：反弹枪改用范围伤害，其余子弹单点伤害
+    var eh = -1;
+    for (var j = 0; j < enemies.length; j++) {
+      var e = enemies[j];
+      if (e.dead) continue;
+      if (b.x > e.x && b.x < e.x + e.w && b.y > e.y && b.y < e.y + e.h) { eh = j; break; }
+    }
+    if (eh >= 0) {
+      var e = enemies[eh];
+      if (isBouncer) {
+        splashDamage(b.x, b.y, b.splash, b.dmg);
+        consumed = true;
+      } else if (b.hit.indexOf(e) === -1) {
+        // 该敌人尚未被此弹命中过
+        hurtEnemy(e, e.maxHp * b.dmg / 100);
+        b.hit.push(e);
+        if (b.pierce > 0) {
+          b.pierce--;                          // 穿透：不消耗，继续飞行
+        } else {
+          if (b.explosive) doExplode = true;   // 已无穿透 → 引爆（爆炸内直接炸死）
+          consumed = true;
+        }
+      }
+      // 已命中的敌人：忽略，继续飞行（避免重复引爆）
+    } else if (tHit === 3 || tHit === 1 || tHit === 2) {
+      if (isBouncer) {
+        if (b.bounce > 0) {                       // 还有反弹次数 → 反弹，不消耗
+          reflectBullet(b, bx0, by0, c, r); b.bounce--;
+          continue;
+        }
+        splashDamage(b.x, b.y, b.splash, b.dmg);  // 反弹耗尽 → 落点范围伤害
+        consumed = true;
+        if (tHit === 1 || tHit === 2) puff(b.x, b.y, 3, '#8a8a6a', 1.4);
+      } else if (tHit === 3) {
+        // 木箱：玩家子弹 50% 击碎
+        if (Math.random() < 0.5) {
+          breakCrate(c, r);
+          puff(b.x, b.y, 8, TH.crate, 2.2);
+          puff(b.x, b.y, 5, TH.crateDark, 1.6);
+          SFX.crate();
+        } else {
+          puff(b.x, b.y, 3, TH.crateDark, 1.4);
+        }
+        consumed = true;
+      } else {
+        consumed = true;
+        puff(b.x, b.y, 3, '#8a8a6a', 1.4);
+      }
+    }
+    if (b.explosive && (tHit === 1 || tHit === 2 || tHit === 3)) doExplode = true;
+    if (doExplode) explode(b.x, b.y, 2, 100, true, true);   // 玩家火箭：2 格半径内直接炸死
+    if (consumed || b.life <= 0) {
+      if (b.life <= 0 && !consumed && isBouncer) splashDamage(b.x, b.y, b.splash, b.dmg);
+      bullets.splice(i, 1);
+    }
+  }
+  for (i = ebullets.length - 1; i >= 0; i--) {
+    b = ebullets[i];
+    b.x += b.vx; b.y += b.vy; b.life--;
+    var c2 = Math.floor(b.x / TILE), r2 = Math.floor(b.y / TILE);
+    var tHit2 = tileAt(c2, r2);
+    var ph = !player.dead && b.x > player.x && b.x < player.x + player.w && b.y > player.y && b.y < player.y + player.h;
+    var consumed = false, doExplode = false;
+    if (tHit2 === 3) {
+      // 木箱：敌方子弹 10% 击碎
+      if (Math.random() < 0.1) {
+        breakCrate(c2, r2);
+        puff(b.x, b.y, 7, TH.crate, 2.0);
+        puff(b.x, b.y, 4, TH.crateDark, 1.5);
+        SFX.crate();
+      } else {
+        puff(b.x, b.y, 2, TH.crateDark, 1.2);
+      }
+      consumed = true;
+    } else if (tHit2 === 1 || tHit2 === 2) {
+      consumed = true;
+      puff(b.x, b.y, 3, '#8a8a6a', 1.2);
+    }
+    if (b.explosive && (tHit2 === 1 || tHit2 === 2 || tHit2 === 3)) doExplode = true;
+    if (ph) {
+      var dmg = b.dmg[0] + Math.random() * (b.dmg[1] - b.dmg[0]);
+      hurtPlayer(Math.round(dmg), true);
+      consumed = true;
+    }
+    if (doExplode) explode(b.x, b.y, 2, 100, true);
+    if (consumed || b.life <= 0) ebullets.splice(i, 1);
+  }
+  for (i = grens.length - 1; i >= 0; i--) {
+    var g = grens[i];
+    g.t += dt;
+    g.vy += 0.42;
+    var moved = moveX(g, g.vx);          //  Grenade 现在有 w/h，会撞墙与落地
+    if (moved) g.vx *= -0.35;
+    var my = moveY(g, g.vy);
+    if (my) { g.vy *= -0.32; g.vx *= 0.7; if (Math.abs(g.vy) < 1.2) g.vy = 0; }  // 落地后贴地静止
+    g.vx *= 0.995;
+    // 不飞出地图左右边界：贴边反弹
+    if (g.x < 0) { g.x = 0; g.vx = Math.abs(g.vx) * 0.35; }
+    if (g.x + g.w > WORLD_W) { g.x = WORLD_W - g.w; g.vx = -Math.abs(g.vx) * 0.35; }
+    // 兜底：万一越过地图底部，贴地
+    if (g.y + g.h > WORLD_H) { g.y = WORLD_H - g.h; g.vy = 0; }
+    if (g.t > 1500) { explode(g.x + 4, g.y + 4, GRENADE_RAD, 100, true); grens.splice(i, 1); }
+  }
+}
+function stepParticles(dt) {
+  for (var i = parts.length - 1; i >= 0; i--) {
+    var p = parts[i];
+    p.x += p.vx; p.y += p.vy; p.vy += 0.09; p.life--;
+    if (p.life <= 0) parts.splice(i, 1);
+  }
+  for (var k = corpses.length - 1; k >= 0; k--) { corpses[k].t++; if (corpses[k].t > 900) corpses.splice(k, 1); }
+}
+function stepDrops(dt) {
+  for (var i = drops.length - 1; i >= 0; i--) {
+    var d = drops[i];
+    d.t++;
+    d.vy += 0.42; if (d.vy > 8) d.vy = 8;
+    d.y += d.vy;
+    var r = Math.floor((d.y + d.h) / TILE), c = Math.floor((d.x + d.w / 2) / TILE);
+    if (solidAt(c, r)) { d.y = r * TILE - d.h; d.vy = 0; }
+    if (d.y > WORLD_H + 100) drops.splice(i, 1);
+    else if (player && !player.dead) {
+      var near = Math.abs((d.x + d.w / 2) - (player.x + player.w / 2)) < 22 && Math.abs((d.y + d.h / 2) - (player.y + player.h / 2)) < 30;
+      if (near) {
+        if (d.type === 'coin') { player.coins += d.val; player.lootedValue += d.val; drops.splice(i, 1); SFX.pick(); }
+        else if (d.type === 'card') { player.cards[d.lv].push(CARD_DURA); player.lootedValue += (CARD_PRICES[d.lv] || 0); drops.splice(i, 1); SFX.pick(); }
+        else if (d.type === 'sell') { player.sell[d.lv] = (player.sell[d.lv] || 0) + 1; player.lootedValue += sellVal(d.lv); drops.splice(i, 1); SFX.pick(); }
+        else if (d.type === 'item') {
+          if (player.items.length < ITEM_CAP) { player.items.push({ tier: d.tier }); player.lootedValue += itemVal(d.tier); drops.splice(i, 1); SFX.pick(); }
+          // 收集物已满（达到 ITEM_CAP）则留在地面（不捡）
+        }
+        else if (d.type === 'book') { player.books[d.tier] = (player.books[d.tier] || 0) + 1; player.lootedValue += BOOK_PRICES[d.tier]; drops.splice(i, 1); SFX.pick(); }
+      }
+    }
+  }
+}
+
+/* ===================== 绘制工具 ===================== */
+function rr(x, y, w, h, col) { ctx.fillStyle = col; ctx.fillRect(x | 0, y | 0, w | 0, h | 0); }
+function txt(s, x, y, col, size, align) {
+  ctx.fillStyle = col || TH.white;
+  ctx.font = (size || 14) + 'px "Microsoft YaHei",sans-serif';
+  ctx.textAlign = align || 'left';
+  ctx.fillText(s, x | 0, y | 0);
+}
+
+function drawSoldier(x, y, w, h, face, col, helm, walk, aim, crouch, gun, climb) {
+  var sw = Math.sin(walk) * 4;
+  // 腿（移动时左右摆动）
+  if (climb) {
+    rr(x + 3, y + h - 10, 5, 10, TH.dirtDark);
+    rr(x + w - 8, y + h - 10, 5, 10, TH.dirtDark);
+  } else {
+    rr(x + 2 + sw, y + h - 12, 5, 12, TH.dirtDark);
+    rr(x + w - 7 - sw, y + h - 12, 5, 12, TH.dirtDark);
+    rr(x + 1 + sw, y + h - 2, 7, 2, TH.ink);
+    rr(x + w - 8 - sw, y + h - 2, 7, 2, TH.ink);
+  }
+  // 身体
+  rr(x + 1, y + 10, w - 2, h - 22, col);
+  rr(x + 1, y + 10, w - 2, 3, helm);
+  // 背包
+  rr(x + (face > 0 ? -2 : w - 2), y + 13, 3, 12, TH.dirtDark);
+  // 头
+  rr(x + 4, y + 2, w - 8, 8, '#c9a882');
+  // 钢盔
+  rr(x + 2, y, w - 4, 5, helm);
+  rr(x + 1, y + 4, w - 2, 2, helm);
+  // 护目镜
+  rr(x + (face > 0 ? w - 8 : 4), y + 4, 4, 2, '#0e1a0c');
+  // 枪 / 刀
+  if (aim !== undefined && aim !== null) {
+    ctx.save();
+    ctx.translate(x + w / 2, y + (crouch ? 12 : 14));
+    ctx.rotate(aim);
+    if (gun === 'knife') {
+      rr(0, -1, 15, 3, '#cfd6dd');     // 刀身（银）
+      rr(0, -2, 5, 5, '#5a3a20');      // 刀柄
+      rr(14, -2, 2, 5, '#eef3f6');     // 刀尖高光
+    } else {
+      var gl = gun || 16;
+      rr(0, -2, gl, 4, '#2a2a24');
+      rr(gl - 3, -3, 5, 3, '#1a1a16');
+    }
+    ctx.restore();
+  }
+}
+
+function drawBackground() {
+  var g = ctx.createLinearGradient(0, 0, 0, VH);
+  g.addColorStop(0, TH.sky1); g.addColorStop(1, TH.sky2);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, VW, VH);
+  // 星空
+  if (TH.stars) {
+    ctx.fillStyle = TH.star;
+    for (var s = 0; s < 60; s++) {
+      var sx = (s * 137 - cam.x * 0.1) % VW; if (sx < 0) sx += VW;
+      var sy = (s * 53) % 280 + 10;
+      rr(sx, sy, 2, 2, TH.star);
+    }
+  }
+  // 远山
+  ctx.fillStyle = TH.hillFar;
+  for (var i = 0; i < 14; i++) {
+    var bx = ((i * 220) - (cam.x * 0.25)) % (VW + 440) - 220;
+    ctx.beginPath(); ctx.moveTo(bx, 420);
+    ctx.lineTo(bx + 110, 300 + (i % 3) * 30); ctx.lineTo(bx + 220, 420); ctx.closePath(); ctx.fill();
+  }
+  // 近山
+  ctx.fillStyle = TH.hillNear;
+  for (var j = 0; j < 10; j++) {
+    var bx2 = ((j * 320) - (cam.x * 0.5)) % (VW + 640) - 320;
+    ctx.beginPath(); ctx.moveTo(bx2, 460);
+    ctx.lineTo(bx2 + 160, 350 + (j % 4) * 24); ctx.lineTo(bx2 + 320, 460); ctx.closePath(); ctx.fill();
+  }
+  // 云 / 烟尘
+  ctx.fillStyle = TH.cloud;
+  for (var k = 0; k < 6; k++) {
+    var cxp = ((k * 260) - (cam.x * 0.35)) % (VW + 520) - 260;
+    var cyp = 70 + (k % 3) * 40;
+    ctx.beginPath(); ctx.ellipse(cxp, cyp, 60, 18, 0, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function drawTerrainRelief() {
+  // 地形起伏可视化：近地表偏亮、越深越暗的垂直渐变 + 高亮地表轮廓线
+  var c0 = Math.max(0, Math.floor(cam.x / TILE) - 1);
+  var c1 = Math.min(COLS - 1, Math.ceil((cam.x + VW) / TILE) + 1);
+  var grad = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+  grad.addColorStop(0, 'rgba(150,200,110,0.22)');
+  grad.addColorStop(0.45, 'rgba(70,110,55,0.06)');
+  grad.addColorStop(1, 'rgba(0,0,0,0.30)');
+  ctx.beginPath();
+  ctx.moveTo(c0 * TILE - cam.x, WORLD_H);
+  for (var c = c0; c <= c1; c++) ctx.lineTo(c * TILE - cam.x, hm[c] * TILE);
+  ctx.lineTo((c1 + 1) * TILE - cam.x, WORLD_H);
+  ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+  // 地表高亮轮廓
+  ctx.beginPath();
+  for (var c2 = c0; c2 <= c1; c2++) {
+    var x = c2 * TILE - cam.x, y = hm[c2] * TILE;
+    if (c2 === c0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = 'rgba(190,225,130,0.9)'; ctx.lineWidth = 2; ctx.stroke(); ctx.lineWidth = 1;
+}
+
+function drawWorld() {
+  drawBackground();
+  ctx.save();
+  ctx.translate(0, -cam.y);
+
+  var c0 = Math.max(0, Math.floor(cam.x / TILE) - 1);
+  var c1 = Math.min(COLS - 1, Math.ceil((cam.x + VW) / TILE) + 1);
+
+  // 地形
+  for (var c = c0; c <= c1; c++) {
+    for (var r = 0; r < ROWS; r++) {
+      var t = tiles[r * COLS + c];
+      if (!t) continue;
+      var sx = c * TILE - cam.x, sy = r * TILE;
+      if (t === 1) {
+        var top = tileAt(c, r - 1) === 0;
+        rr(sx, sy, TILE, TILE, top ? TH.dirt : TH.dirtDark);
+        if (top) rr(sx, sy, TILE, 5, TH.grass);
+        rr(sx, sy, TILE, 1, 'rgba(0,0,0,0.25)');
+      } else if (t === 2) {
+        rr(sx, sy, TILE, TILE, TH.steel);
+        rr(sx, sy, TILE, 3, TH.steelDark);
+        rr(sx + 2, sy + 5, 3, 3, TH.steelDark);
+        rr(sx + 13, sy + 12, 3, 3, TH.steelDark);
+      } else if (t === 3) {
+        rr(sx, sy, TILE, TILE, TH.crate);
+        rr(sx, sy, TILE, 3, '#9a6a2e');
+        rr(sx + 2, sy + 3, TILE - 4, 2, TH.crateDark);
+        rr(sx + 2, sy + TILE - 5, TILE - 4, 2, TH.crateDark);
+        rr(sx + 9, sy + 3, 2, TILE - 6, TH.crateDark);
+      }
+    }
+  }
+  drawTerrainRelief();
+  // 梯子
+  for (var li = 0; li < ladders.length; li++) {
+    var L = ladders[li];
+    var lx = L.c * TILE - cam.x;
+    if (lx < -40 || lx > VW + 40) continue;
+    rr(lx + 3, L.top * TILE, 3, (L.bot - L.top + 1) * TILE, '#6a5a30');
+    rr(lx + 13, L.top * TILE, 3, (L.bot - L.top + 1) * TILE, '#6a5a30');
+    for (var ry = L.top; ry <= L.bot; ry++) rr(lx + 3, ry * TILE + 8, 13, 3, '#8a7440');
+  }
+  // 目标旗 + 绳梯 + 飞机
+  drawGoalFlag();
+  // 红旗（战役为固定据点，跑酷为跟随刷敌）
+  if (funMode) drawRedFlag(); else drawRedFlags();
+  // 房卡房门
+  drawKeyHouses();
+  // 死亡木盒（比木箱大，按 H 开盒捡回）
+  for (var bx2 = 0; bx2 < deathBoxes.length; bx2++) {
+    var db = deathBoxes[bx2]; if (db.taken) continue;
+    var dx2 = db.x - cam.x, dy2 = db.y - cam.y;
+    if (dx2 < -60 || dx2 > VW + 60) continue;
+    ctx.fillStyle = '#6a4424'; ctx.fillRect(dx2, dy2, db.w, db.h);
+    ctx.fillStyle = '#8a5a2e'; ctx.fillRect(dx2 + 3, dy2 + 3, db.w - 6, db.h - 6);
+    ctx.strokeStyle = '#caa06a'; ctx.lineWidth = 2; ctx.strokeRect(dx2 + 1, dy2 + 1, db.w - 2, db.h - 2);
+    rr(dx2 + 6, dy2 + db.h / 2 - 1, db.w - 12, 3, '#4a2e16');
+    txt('盒', dx2 + db.w / 2, dy2 + db.h / 2 + 4, '#ffe', 12, 'center');
+    if (Math.abs((player.x + player.w / 2) - (db.x + db.w / 2)) < 44 && Math.abs((player.y + player.h) - (db.y + db.h)) < 56) {
+      txt('按 H 开盒', dx2 + db.w / 2, dy2 - 6, TH.gold, 12, 'center');
+    }
+  }
+  // 尸体
+  for (var k = 0; k < corpses.length; k++) {
+    var cp = corpses[k]; var a = Math.max(0, 1 - cp.t / 900);
+    ctx.globalAlpha = a * 0.85;
+    drawSoldier(cp.x - cam.x, cp.y + 14, 18, 24, cp.face, '#3a3a30', cp.helm, 0, 0, true, 14, false);
+    ctx.globalAlpha = 1;
+  }
+  // 掉落物
+  for (var di = 0; di < drops.length; di++) {
+    var d = drops[di];
+    var dx = d.x - cam.x;
+    if (dx < -60 || dx > VW + 60) continue;
+    if (d.type === 'coin') {
+      var cxp = dx + 5, cyp = d.y + 5;
+      ctx.fillStyle = '#ffcf3a'; ctx.beginPath(); ctx.arc(cxp, cyp, 5, 0, Math.PI * 2); ctx.fill();
+      txt(String(d.val), cxp, cyp + 3, '#7a4a00', 9, 'center');
+      continue;
+    }
+    if (d.type === 'card') {
+      var ccol = cardCol(d.lv);
+      rr(dx + 1, d.y, 12, 16, '#1a1a16'); rr(dx + 2, d.y + 1, 10, 14, ccol);
+      rr(dx + 4, d.y + 3, 6, 4, '#ffffff'); rr(dx + 5, d.y + 8, 2, 5, '#ffffff');
+      txt('K' + d.lv, dx + 7, d.y - 4, ccol, 9, 'center');
+      continue;
+    }
+    if (d.type === 'sell') {
+      var scol = cardCol(d.lv), sgx = dx + 7, sgy = d.y + 7;
+      ctx.fillStyle = scol;
+      ctx.beginPath(); ctx.moveTo(sgx, sgy - 6); ctx.lineTo(sgx + 6, sgy); ctx.lineTo(sgx, sgy + 6); ctx.lineTo(sgx - 6, sgy); ctx.closePath(); ctx.fill();
+      txt(String(sellVal(d.lv)), sgx, sgy + 16, '#ffe9a0', 9, 'center');
+      continue;
+    }
+    if (d.type === 'item') {
+      var icol = itemCol(d.tier), igx = dx + 7, igy = d.y + 7;
+      drawLootIcon(d.tier, igx, igy);                                  // 对应实物 + 该色轮廓光芒
+      txt(itemVal(d.tier) + '金', igx, igy + 16, icol, 9, 'center');   // 站在上面只显示价格
+      continue;
+    }
+    if (d.type === 'book') {
+      var bcol = cardCol(d.tier), bgx = dx + 7, bgy = d.y + 7;
+      rr(dx + 1, d.y, 12, 16, '#2a1a2a'); rr(dx + 2, d.y + 1, 10, 14, bcol);
+      rr(dx + 4, d.y + 3, 6, 10, '#fff8e0');
+      txt(TIER_NAMES[d.tier] + '书', dx + 7, d.y - 4, bcol, 8, 'center');
+      continue;
+    }
+    if (d.type === 'gren') {
+      rr(dx, d.y, 12, 12, '#3d4a26'); rr(dx + 3, d.y - 3, 3, 4, '#6a7a3a');
+      rr(dx + 1, d.y + 3, 10, 2, '#5a6a30');
+    } else {
+      if (d.gold) {
+        var gxa = dx + d.w / 2, gya = d.y + d.h / 2;
+        ctx.globalAlpha = 0.3 + 0.22 * Math.sin(elapsed / 120);
+        ctx.fillStyle = '#ffd86a';
+        ctx.beginPath(); ctx.arc(gxa, gya, 24, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+      var gn = WEAPONS[d.gun].name;
+      rr(dx, d.y + 3, 26, 5, '#2a2a24'); rr(dx + 6, d.y + 8, 5, 4, '#1a1a16');
+      rr(dx + (d.mag > 0 ? 1 : 20), d.y - 2, 5, 5, d.mag > 0 ? (d.gold ? '#ffd86a' : TH.gold) : '#6a6a6a');
+      txt(gn, dx + 13, d.y - 5, d.mag > 0 ? (d.gold ? '#ffd86a' : '#c9d6b0') : '#7a7a6a', 10, 'center');
+      if (d.gold) txt('★ 稀有掉落 ★', dx + 13, d.y - 18, '#ffd86a', 10, 'center');
+    }
+  }
+  // 敌人
+  for (var ei = 0; ei < enemies.length; ei++) {
+    var e = enemies[ei];
+    var ex = e.x - cam.x;
+    if (ex < -80 || ex > VW + 80) continue;
+    if (e.dead) {
+      var t = Math.min(1, e.deadT / 900);
+      ctx.globalAlpha = 1 - t;
+      drawSoldier(ex, e.y + t * 16, e.w, e.h, e.face, '#4a4a3a', e.t.helm, 0, t * 1.6, true, 14, false);
+      ctx.globalAlpha = 1;
+      continue;
+    }
+    var aimA = Math.atan2((player.y + player.h / 2) - (e.y + 15), (player.x + player.w / 2) - (e.x + e.w / 2));
+    drawSoldier(ex, e.y, e.w, e.h, e.face, e.hurtT > 0 ? '#d8a0a0' : e.t.col, e.t.helm, e.walk, aimA, false, 15, false);
+    if (e.alert) { rr(ex + e.w / 2 - 3, e.y - 12, 6, 6, TH.red); txt('!', ex + e.w / 2, e.y - 14, TH.red, 12, 'center'); }
+    rr(ex - 2, e.y - 6, e.w + 4, 4, '#111');
+    rr(ex - 1, e.y - 5, (e.w + 2) * Math.max(0, e.hp / e.maxHp), 2, e.hp > e.maxHp * 0.4 ? TH.green : TH.red);
+    txt(e.t.name, ex + e.w / 2, e.y - 10, '#8fa07a', 9, 'center');
+    if (e.t.stealer && e.stealT > 0) {
+      var sp = Math.min(1, e.stealT / STEAL_TIME);
+      rr(ex - 12, e.y - 22, 36, 5, '#111');
+      rr(ex - 11, e.y - 21, 34 * sp, 3, '#d04ad0');
+      txt('抢夺中', ex + e.w / 2, e.y - 26, '#e08ad0', 9, 'center');
+    }
+  }
+  // 玩家
+  if (!player.dead) {
+    var px = player.x - cam.x;
+    var mwx = mouse.x + cam.x, mwy = mouse.y + cam.y;
+    var pang = Math.atan2(mwy - (player.y + (player.crouch ? 12 : 14)), mwx - (player.x + player.w / 2));
+    var blink = false;
+    if (player.hurtT > 0 && Math.floor(player.hurtT / 60) % 2 === 0) blink = true;
+    if (player.invuln > 0 && Math.floor(elapsed / 120) % 2 === 0) blink = true;
+    if (blink) ctx.globalAlpha = 0.45;
+    drawSoldier(px, player.y, player.w, player.h, player.face, TH.green, TH.greenD, player.walk, pang, player.crouch, player.wp === 'knife' ? 'knife' : (player.noGun ? 0 : (player.wp === 'mg' ? 22 : player.wp === 'rocket' ? 20 : 16)), !!player.onLadder);
+    ctx.globalAlpha = 1;
+    if (player.invuln > 0) {
+      var ax = player.x + player.w / 2 - cam.x, ay = player.y + player.h / 2;
+      ctx.globalAlpha = 0.25 + 0.2 * Math.sin(elapsed / 90);
+      ctx.strokeStyle = TH.accent; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(ax, ay, 22, 0, Math.PI * 2); ctx.stroke();
+      ctx.globalAlpha = 1; ctx.lineWidth = 1;
+    }
+  }
+  // 子弹
+  for (var bi = 0; bi < bullets.length; bi++) { var b = bullets[bi]; rr(b.x - cam.x - 2, b.y - 1, 6, 3, '#e8d98a'); }
+  for (var bj = 0; bj < ebullets.length; bj++) { var b2 = ebullets[bj]; rr(b2.x - cam.x - 2, b2.y - 1, 6, 3, '#e88a5a'); }
+  // 手榴弹（飞行中）
+  for (var gi = 0; gi < grens.length; gi++) { var gg = grens[gi]; rr(gg.x - cam.x, gg.y, 8, 8, '#3d4a26'); rr(gg.x - cam.x + 2, gg.y - 2, 2, 3, '#6a7a3a'); }
+  // 手雷瞄准轨迹
+  if (grenAiming && player && !player.dead && (grenInfinite() || player.grens > 0)) {
+    var L = grenadeLaunch();
+    var sim = simGrenade(L.ox, L.oy, L.vx, L.vy);
+    for (var pi = 0; pi < sim.pts.length; pi++) {
+      var a2 = 0.85 - pi / sim.pts.length * 0.6;
+      ctx.globalAlpha = Math.max(0.2, a2);
+      rr(sim.pts[pi].x - cam.x - 1, sim.pts[pi].y - 1, 3, 3, TH.accent);
+    }
+    ctx.globalAlpha = 1;
+    // 落点标记
+    var lx2 = sim.land.x - cam.x, ly2 = sim.land.y;
+    ctx.strokeStyle = TH.accent; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(lx2, ly2, 9, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(lx2 - 13, ly2); ctx.lineTo(lx2 + 13, ly2);
+    ctx.moveTo(lx2, ly2 - 13); ctx.lineTo(lx2, ly2 + 13); ctx.stroke();
+    ctx.lineWidth = 1;
+  }
+  // 粒子
+  for (var pi2 = 0; pi2 < parts.length; pi2++) {
+    var p2 = parts[pi2];
+    ctx.globalAlpha = Math.max(0, Math.min(1, p2.life / p2.max));
+    rr(p2.x - cam.x, p2.y, p2.s, p2.s, p2.col);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+  // 准星（屏幕坐标，不受镜头偏移影响）
+  if (state === 'play' && player && !player.dead) {
+    var cx = mouse.x, cy = mouse.y;
+    rr(cx - 8, cy - 1, 6, 2, TH.red); rr(cx + 2, cy - 1, 6, 2, TH.red);
+    rr(cx - 1, cy - 8, 2, 6, TH.red); rr(cx - 1, cy + 2, 2, 6, TH.red);
+  }
+}
+
+function drawGoalFlag() {
+  if (!flag) return;
+  var fx = flag.x - cam.x;
+  if (fx > -200 && fx < VW + 200) {
+    rr(fx - 2, flag.y - flag.h, 4, flag.h, '#8a8a7a');
+    for (var i = 0; i < 22; i++) {
+      var wv = Math.sin(elapsed / 200 + i * 0.4) * 3;
+      rr(fx + 2 + i * 1.6, flag.y - flag.h + 6 + wv, 1.6, 26, i % 2 ? '#1a2a12' : TH.greenD);
+    }
+    rr(fx - 8, flag.y - 4, 18, 4, TH.dirtDark);
+    if (!funMode) {
+      if (!ropeReady) {
+        var pct = Math.min(1, holdTimer / 10000);
+        rr(fx - 40, flag.y - flag.h - 26, 80, 8, '#111');
+        rr(fx - 39, flag.y - flag.h - 25, 78 * pct, 6, TH.gold);
+      } else {
+        rr(fx - 44, flag.y - flag.h - 22, 88, 14, 'rgba(0,0,0,0.4)');
+        txt('撤离点已就绪', fx, flag.y - flag.h - 12, TH.gold, 12, 'center');
+      }
+    }
+  }
+  if (ropeReady && !funMode) {
+    var rx = rope.x - cam.x;
+    for (var r2 = rope.top; r2 < rope.bot; r2 += 12) {
+      rr(rx - 4, r2, 2, 12, '#a08a4a');
+      rr(rx + 4, r2, 2, 12, '#a08a4a');
+      rr(rx - 4, r2 + 5, 10, 2, '#c0a85a');
+    }
+  }
+  if (ropeReady && !funMode) {
+    var ax = plane.x - cam.x, ay = plane.y + Math.sin(elapsed / 400) * 4;
+    rr(ax, ay + 12, 120, 14, '#2c3a22');
+    rr(ax + 30, ay + 4, 16, 10, '#243019');
+    rr(ax + 108, ay + 6, 20, 8, '#3a4a2a');
+    rr(ax + 20, ay - 4, 54, 6, '#2c3a22');
+    rr(ax + 118, ay - 2, 16, 6, '#3a4a2a');
+    rr(ax + 40, ay + 26, 6, 8, '#1a2412');
+    rr(ax + 80, ay + 26, 6, 8, '#1a2412');
+    txt('撤离点', ax + 60, ay - 10, TH.gold, 11, 'center');
+  }
+}
+
+function drawRedFlags() {
+  if ((!redFlags || redFlags.length === 0) && !extractFlag) return;
+  for (var fi = 0; fi < redFlags.length; fi++) {
+    var r = redFlags[fi];
+    var fx = r.x - cam.x;
+    if (fx < -60 || fx > VW + 60) continue;
+    var baseY = r.y;
+    if (r.captured) {
+      // 已夺取 → 我方复活点
+      ctx.globalAlpha = 0.25 + 0.15 * Math.sin(elapsed / 200);
+      rr(fx - 12, baseY - 54, 24, 54, TH.accent);
+      ctx.globalAlpha = 1;
+      rr(fx - 2, baseY - 46, 4, 46, '#9aa0a6');
+      for (var i = 0; i < 12; i++) {
+        var wv = Math.sin(elapsed / 220 + i * 0.5) * 2;
+        rr(fx + 2 + i * 1.8, baseY - 44 + wv, 1.8, 16, TH.accent);
+      }
+      rr(fx - 30, baseY - 64, 60, 14, 'rgba(0,0,0,0.4)');
+      txt('复活点', fx, baseY - 54, TH.accent, 11, 'center');
+    } else {
+      // 敌方红旗：刷敌 + 夺旗进度
+      rr(fx - 2, baseY - 50, 4, 50, '#9aa0a6');
+      for (var i2 = 0; i2 < 12; i2++) {
+        var wv2 = Math.sin(elapsed / 180 + i2 * 0.5) * 2.5;
+        rr(fx + 2 + i2 * 1.8, baseY - 48 + wv2, 1.8, 18, '#d83a2e');
+      }
+      rr(fx - 14, baseY - 4, 28, 4, '#7a1a14');
+      if (r.holdT > 0) {
+        var pr = Math.min(1, r.holdT / 5000);
+        rr(fx - 22, baseY - 70, 44, 6, '#111');
+        rr(fx - 21, baseY - 69, 42 * pr, 4, TH.accent);
+        txt('夺旗中', fx, baseY - 80, TH.accent, 11, 'center');
+      } else {
+        ctx.globalAlpha = 0.22 + 0.14 * Math.sin(elapsed / 150);
+        rr(fx - 18, baseY - 60, 36, 60, '#d83a2e');
+        ctx.globalAlpha = 1;
+        rr(fx - 36, baseY - 72, 72, 14, 'rgba(0,0,0,0.45)');
+        txt('红旗·刷敌', fx, baseY - 62, '#ff7a6a', 11, 'center');
+      }
+    }
+  }
+  // 撤离点进攻红旗
+  if (extractFlag) {
+    var exf = extractFlag.x - cam.x;
+    if (!(exf < -60 || exf > VW + 60)) {
+      var eby = extractFlag.y;
+      rr(exf - 2, eby - 50, 4, 50, '#9aa0a6');
+      for (var ie = 0; ie < 12; ie++) {
+        var ewv = Math.sin(elapsed / 180 + ie * 0.5) * 2.5;
+        rr(exf + 2 + ie * 1.8, eby - 48 + ewv, 1.8, 18, '#d83a2e');
+      }
+      rr(exf - 14, eby - 4, 28, 4, '#7a1a14');
+      ctx.globalAlpha = 0.22 + 0.14 * Math.sin(elapsed / 150);
+      rr(exf - 18, eby - 60, 36, 60, '#d83a2e');
+      ctx.globalAlpha = 1;
+      rr(exf - 40, eby - 72, 80, 14, 'rgba(0,0,0,0.45)');
+      txt('撤离点·刷敌', exf, eby - 62, '#ff7a6a', 11, 'center');
+    }
+  }
+}
+function drawKeyHouses() {
+  if (funMode || !keyHouses || keyHouses.length === 0) return;
+  for (var i = 0; i < keyHouses.length; i++) {
+    var h = keyHouses[i];
+    var dx = h.x - cam.x;
+    if (dx < -70 || dx > VW + 70) continue;
+    var baseY = h.y;
+    if (h.opened) {
+      ctx.globalAlpha = 0.35;
+      rr(dx - 16, baseY - 54, 32, 54, '#3a3a2a');
+      ctx.globalAlpha = 1;
+      rr(dx - 12, baseY - 50, 24, 4, '#6a6a4a');
+      continue;
+    }
+    rr(dx - 16, baseY - 56, 32, 56, '#2a2418');
+    rr(dx - 13, baseY - 53, 26, 53, '#4a3a22');
+    rr(dx - 10, baseY - 50, 20, 50, cardCol(h.lv));
+    rr(dx - 3, baseY - 30, 6, 8, '#1a140a');
+    txt('K' + h.lv, dx, baseY - 40, '#1a140a', 12, 'center');
+    rr(dx - 22, baseY - 72, 44, 14, 'rgba(0,0,0,0.5)');
+    txt('需K' + h.lv + '卡', dx, baseY - 61, '#ffe9a0', 11, 'center');
+    if (h.extraction) {
+      rr(dx - 40, baseY - 90, 80, 14, 'rgba(120,20,20,0.6)');
+      txt('撤离点·开此门触发进攻', dx, baseY - 79, '#ff9a8a', 10, 'center');
+    }
+  }
+}
+function drawRedFlag() {
+  var fx = redFlag.x - cam.x;
+  if (fx < -60 || fx > VW + 60) return;
+  var baseY = redFlag.y;
+  rr(fx - 2, baseY - 50, 4, 50, '#9aa0a6');                       // 旗杆
+  for (var i = 0; i < 12; i++) {
+    var wv = Math.sin(elapsed / 180 + i * 0.5) * 2.5;
+    rr(fx + 2 + i * 1.8, baseY - 48 + wv, 1.8, 18, '#d83a2e');     // 红旗面
+  }
+  rr(fx - 14, baseY - 4, 28, 4, '#7a1a14');                       // 底座
+  if (redFlag.active) {                                            // 玩家离开：红色光晕 + 提示
+    ctx.globalAlpha = 0.25 + 0.15 * Math.sin(elapsed / 150);
+    rr(fx - 18, baseY - 60, 36, 60, '#d83a2e');
+    ctx.globalAlpha = 1;
+    rr(fx - 36, baseY - 72, 72, 14, 'rgba(0,0,0,0.45)');
+    txt('红旗召唤中', fx, baseY - 62, '#ff7a6a', 11, 'center');
+  }
+}
+
+/* ===================== HUD ===================== */
+function drawHUD() {
+  var p = player;
+  rr(12, 12, 204, 18, '#0c1a0c'); rr(14, 14, 200, 14, '#22150f');
+  rr(14, 14, 200 * Math.max(0, p.hp / p.maxHp), 14, p.hp > p.maxHp * 0.4 ? TH.green : TH.red);
+  txt('HP ' + Math.max(0, Math.round(p.hp)), 20, 26, TH.white, 12);
+  var w = WEAPONS[p.wp];
+  if (p.wp === 'knife') {
+    txt('刀（近战）', 12, 52, '#cfd8e0', 15);
+    txt('贴脸挥击 · 1秒/次 · 1/3血', 12, 72, '#9fb0a0', 13);
+  } else if (p.noGun) {
+    txt('无枪', 12, 52, TH.red, 15);
+    txt('右键拾取武器', 12, 72, TH.red, 14);
+  } else {
+    var bL2 = player.bulletTier && player.bulletTier[p.wp] === 2;
+    txt(w.name + (bL2 ? ' ★二级弹' : ''), 12, 52, bL2 ? '#ffcf3f' : TH.gold, 15);
+    if (funMode) {
+      txt('∞  无限弹药', 12, 72, TH.green, 14);
+    } else {
+      txt(p.mag[p.wp] + ' / ' + p.reserve, 12, 72, p.mag[p.wp] > 0 ? TH.white : TH.red, 14);
+    }
+  }
+  if (p.reloadT > 0) {
+    rr(12, 78, 90, 6, '#222');
+    rr(12, 78, 90 * (1 - p.reloadT / (p.reloadDur || w.reload)), 6, TH.gold);
+    txt('换弹中', 106, 84, TH.gold, 11);
+  }
+  txt(grenInfinite() ? '手雷 G × ∞' : '手雷 G × ' + p.grens, 12, 98, grenInfinite() ? TH.green : (p.grens > 0 ? '#b8c8a0' : '#a05a4a'), 13);
+  if (!funMode) {
+    txt('金币 ' + p.coins, 12, 158, TH.gold, 13);
+    txt('血包 ' + p.healthPacks + '/' + MAX_HEALTHPACKS + '（F 使用 +700）', 12, 176, p.healthPacks > 0 ? '#ff9a8a' : '#7a6a6a', 13);
+  }
+  var armorCol = p.armor > 0 ? (p.armorHp > 0 ? '#9fd0c0' : '#a05a4a') : '#6a7a5a';
+  txt('护甲 ' + (p.armor > 0 ? (ARMOR_DEFS[p.armor].name + ' · 剩 ' + p.armorHp + '/' + ARMOR_DEFS[p.armor].blocks + ' 发') : '无（商城购买）'), 12, 194, armorCol, 13);
+  txt('武器栏 ' + barFilled() + '/3 · 武器背包 ' + p.bag.length + '/' + bagCap() + ' · 收集物 ' + p.items.length + '/' + ITEM_CAP + '（1/2/3 切换 · E 仓库）', 12, 212, TH.white, 13);
+  txt('噪音', 12, 120, '#7a8a6a', 11);
+  rr(44, 111, 90, 9, '#141c10');
+  var nw = 90 * Math.min(1, p.noise);
+  rr(44, 111, nw, 9, p.noise > 0.7 ? TH.red : p.noise > 0.35 ? TH.gold : TH.green);
+  if (p.sprint) txt('疾跑中', 44, 138, TH.red, 12);
+  else txt('SHIFT 疾跑', 44, 138, '#5a6a4a', 11);
+  if (p.invuln > 0) txt('★ 无敌护盾 ' + (p.invuln / 1000).toFixed(1) + 's（不可开枪·可扔手雷）', VW / 2, 30, TH.accent, 14, 'center');
+  txt('击杀 ' + stats.kills + '   阵亡 ' + stats.deaths, 12, 228, '#b8c8a0', 13);
+  if (funMode) {
+    txt('娱乐关卡 · 第' + (funSelLevel + 1) + '阶 ' + FUN_LEVELS[funSelLevel].name + ' · 距终点 ' + Math.max(0, Math.round((p.y - funGoalY) / 10)) + 'm', 12, 246, '#8fa07a', 12);
+  } else {
+    txt('第 ' + (LEVEL + 1) + ' / ' + LEVELS.length + ' 关 · 距撤离点 ' + Math.max(0, Math.round((flag.x - p.x) / 10)) + 'm', 12, 246, TH.accent, 12);
+  }
+  var prog = funMode ? Math.max(0, Math.min(1, (WORLD_H - p.y) / (WORLD_H - funGoalY))) : Math.max(0, Math.min(1, p.x / flag.x));
+  rr(VW / 2 - 160, VH - 18, 320, 6, '#141c10');
+  rr(VW / 2 - 160, VH - 18, 320 * prog, 6, TH.green);
+  rr(VW / 2 - 160 + 320 * prog - 2, VH - 22, 4, 14, TH.white);
+  if (nearLadder(p) && !p.onLadder) txt('按 空格 登梯', VW / 2, VH - 40, TH.gold, 14, 'center');
+  else if (ropeReady && nearRope(p) && !p.onLadder) txt('按 空格 攀爬绳梯登机', VW / 2, VH - 40, TH.gold, 15, 'center');
+  else if (p.onLadder) txt('W / S 上下，空格 离开', VW / 2, VH - 40, TH.gold, 14, 'center');
+  else if (!funMode) {
+    var onFlag = false;
+    for (var fk2 = 0; fk2 < redFlags.length; fk2++) {
+      var rf2 = redFlags[fk2];
+      if (!rf2.captured && Math.abs((p.x + p.w / 2) - rf2.x) < 30 && Math.abs((p.y + p.h) - rf2.y) < 16) { onFlag = true; break; }
+    }
+    if (onFlag) txt('站在红旗上 5 秒夺取为复活点', VW / 2, VH - 40, TH.accent, 14, 'center');
+  }
+  for (var i = 0; i < drops.length; i++) {
+    var d = drops[i];
+    if (Math.abs((d.x + d.w / 2) - (p.x + p.w / 2)) < 26 && Math.abs((d.y + d.h / 2) - (p.y + p.h / 2)) < 42) {
+      txt('右键拾取', VW / 2, VH - 62, TH.gold, 13, 'center'); break;
+    }
+  }
+  // 房卡房门交互提示
+  if (!funMode && nearDoor) {
+    var dh = nearDoor, has = player.cardPack[dh.lv] && player.cardPack[dh.lv].length > 0;
+    rr(VW / 2 - 120, VH - 100, 240, 40, has ? '#1c3310' : '#331a1a');
+    rr(VW / 2 - 120, VH - 100, 240, 3, has ? TH.green : '#a05a4a');
+    txt(has ? ('按 V 开门 · 消耗 K' + dh.lv + ' 房卡 ' + ((DIFFKEY === 2) ? 3 : 2) + ' 点耐久') : ('卡包内需 K' + dh.lv + ' 房卡（仓库「装入卡包」）'), VW / 2, VH - 75, has ? TH.white : '#dd8866', 13, 'center');
+  }
+  drawMinimap();
+}
+function drawMinimap() {
+  if (state !== 'play' && state !== 'pause') return;
+  var mw = 250, mh = 80, mx = VW - mw - 60, my = 24;   // 右上角，但向左偏移一点（非贴边）
+  rr(mx - 4, my - 16, mw + 8, mh + 20, 'rgba(8,18,10,0.82)');
+  txt('地形小图', mx, my - 4, '#9fc08a', 11);
+  // 地形轮廓
+  ctx.beginPath();
+  for (var c = 0; c <= COLS; c += 2) {
+    var hc = hm[Math.min(COLS - 1, c)];
+    var tx = mx + (c / COLS) * mw, ty = my + (hc / ROWS) * mh;
+    if (c === 0) ctx.moveTo(tx, ty); else ctx.lineTo(tx, ty);
+  }
+  ctx.lineTo(mx + mw, my + mh); ctx.lineTo(mx, my + mh); ctx.closePath();
+  ctx.fillStyle = 'rgba(60,95,45,0.55)'; ctx.fill();
+  ctx.beginPath();
+  for (var c2 = 0; c2 <= COLS; c2 += 2) {
+    var hc2 = hm[Math.min(COLS - 1, c2)];
+    var tx2 = mx + (c2 / COLS) * mw, ty2 = my + (hc2 / ROWS) * mh;
+    if (c2 === 0) ctx.moveTo(tx2, ty2); else ctx.lineTo(tx2, ty2);
+  }
+  ctx.strokeStyle = '#9fd070'; ctx.lineWidth = 1.5; ctx.stroke(); ctx.lineWidth = 1;
+  function mp(wx, wy) { return [mx + (wx / WORLD_W) * mw, my + (wy / WORLD_H) * mh]; }
+  // 视野框
+  var vx = mx + (cam.x / WORLD_W) * mw, vw = Math.max(4, (VW / WORLD_W) * mw);
+  ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(vx, my, vw, mh);
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.strokeRect(vx, my, vw, mh);
+  // 起点 / 终点
+  var sp = mp(spawn.x, spawn.y); ctx.fillStyle = '#cfd8c0'; ctx.beginPath(); ctx.arc(sp[0], sp[1], 2.5, 0, 7); ctx.fill();
+  if (flag) { var gp = mp(flag.x, flag.y); ctx.fillStyle = TH.gold; ctx.beginPath(); ctx.arc(gp[0], gp[1], 2.5, 0, 7); ctx.fill(); }
+  // 红旗
+  for (var ri = 0; ri < redFlags.length; ri++) {
+    var rfp = mp(redFlags[ri].x, redFlags[ri].y);
+    ctx.fillStyle = redFlags[ri].captured ? TH.accent : '#e04434';
+    ctx.fillRect(rfp[0] - 2, rfp[1] - 2, 4, 4);
+  }
+  if (extractFlag) { var efp = mp(extractFlag.x, extractFlag.y); ctx.fillStyle = '#ff3a2a'; ctx.fillRect(efp[0] - 2, efp[1] - 2, 4, 4); }
+  // 房卡房门
+  for (var ki = 0; ki < keyHouses.length; ki++) {
+    var khp = mp(keyHouses[ki].x, keyHouses[ki].y);
+    ctx.fillStyle = keyHouses[ki].opened ? '#6a6a5a' : cardCol(keyHouses[ki].lv);
+    ctx.fillRect(khp[0] - 2, khp[1] - 3, 4, 6);
+  }
+  // 死亡木盒
+  for (var dbi = 0; dbi < deathBoxes.length; dbi++) {
+    if (deathBoxes[dbi].taken) continue;
+    var dbp = mp(deathBoxes[dbi].x + 15, deathBoxes[dbi].y + 13);
+    ctx.fillStyle = '#caa06a'; ctx.fillRect(dbp[0] - 2, dbp[1] - 2, 5, 5);
+  }
+  // 敌人
+  ctx.fillStyle = '#ff5a4a';
+  for (var ei = 0; ei < enemies.length; ei++) {
+    if (enemies[ei].dead) continue;
+    var ep = mp(enemies[ei].x, enemies[ei].y + enemies[ei].h / 2);
+    ctx.fillRect(ep[0] - 1, ep[1] - 1, 2, 2);
+  }
+  // 玩家
+  if (player && !player.dead) {
+    var pp = mp(player.x + player.w / 2, player.y + player.h / 2);
+    ctx.fillStyle = TH.green; ctx.beginPath(); ctx.arc(pp[0], pp[1], 3, 0, 7); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
+  }
+}
+function drawBanner() {
+  if (bannerT <= 0) return;
+  var a = Math.min(1, bannerT / 600);
+  ctx.globalAlpha = a;
+  rr(VW / 2 - 180, 70, 360, 54, 'rgba(0,0,0,0.45)');
+  rr(VW / 2 - 180, 70, 360, 3, TH.accent);
+  txt(bannerText, VW / 2, 104, TH.white, 26, 'center');
+  ctx.globalAlpha = 1;
+}
+
+/* ===================== 页面 ===================== */
+var homeBtns = [], resultBtns = [], pauseBtns = [], tutBtns = [], lsBtns = [], wsBtns = [], flsBtns = [], diffBtns = [];
+var wsMode = 0, wsLevel = 0, wsBack = 'home';   // 武器选择：0=娱乐关 1=战役（简单模式选武器开局）
+var showHelp = false;
+var tutorialMode = false;   // true = 新手
+var tutStep = 0, showTutorial = false;
+var tipEl = document.getElementById('tip');
+function setTip(on) { if (tipEl) tipEl.style.display = on ? 'block' : 'none'; }
+
+// 新手教学分页（必须包含，教方法）
+var TUT_PAGES = [
+  { title: '移动与姿态', lines: [
+    'A / D 左右移动，W 跳跃，S 下蹲。',
+    '站立不动时噪音为 0，远处敌人听不到你——这是潜行的关键。',
+    '按住 S 下蹲慢移，噪音极低，适合悄悄接近。'
+  ] },
+  { title: '射击与换弹', lines: [
+    '鼠标控制枪口方向，按住左键射击，R 换弹。',
+    'Q 丢弃当前枪械；站到掉落的武器上按鼠标右键拾取。',
+    '弹药耗尽无法拾取，注意保留备用弹。'
+  ] },
+  { title: '手雷与木箱', lines: [
+    '长按 G 显示抛物线落点轨迹，松开 G 投掷（初速与预览一致）。',
+    '机枪/手枪/霰弹枪每发 50% 击碎木箱；敌方子弹 10% 击碎。',
+    '木箱被击碎或炸开必掉一颗手雷（100%）。'
+  ] },
+  { title: '梯子与重生点', lines: [
+    '地图中段有一座平台与梯子，靠近按空格登上，W/S 上下。',
+    '平台上有一面旗：站上去停留 5 秒即设为重生点。',
+    '阵亡后会在重生点复活，不用退回起点。'
+  ] },
+  { title: '撤离与目标', lines: [
+    '向东推进到东端旗杆，坚守 10 秒放下绳梯。',
+    '靠近绳梯按空格登机即可撤离，进入下一关。',
+    '抵达撤离点后，远处常驻一面敌方红旗，每 10 秒召唤一个随机兵种（不含抢旗手）发起进攻。',
+    '共多关，第 1 关最简单、最后一关最难，每关地图都不同。'
+  ] }
+];
+// 难度选择条（按钮并入传入的 arr，由主循环统一派发点击）
+function drawDiffRow(arr, cx, y, w, h) {
+  var n = DIFFS.length, gap = 14;
+  var totalW = n * w + (n - 1) * gap;
+  var sx = cx - totalW / 2;
+  for (var i = 0; i < n; i++) {
+    var bx = sx + i * (w + gap);
+    var sel = i === DIFFKEY;
+    var hov = mouse.x > bx && mouse.x < bx + w && mouse.y > y && mouse.y < y + h;
+    rr(bx, y, w, h, sel ? TH.greenD : (hov ? '#1c3320' : '#102014'));
+    rr(bx, y, w, 2, sel ? TH.green : '#2c4a30');
+    txt(DIFFS[i].name, bx + w / 2, y + h / 2 + 5, sel ? TH.white : '#cfe0bc', 15, 'center');
+    arr.push({ r: [bx, y, w, h], cb: (function (idx) { return function () { DIFFKEY = idx; DIFF = DIFFS[idx]; }; })(i) });
+  }
+}
+
+// 装备选好后再选难度：单独一屏，选定后按新难度重建本关世界并保留已购装备与资金
+function drawDiffSelect() {
+  ctx.fillStyle = '#07100a'; ctx.fillRect(0, 0, VW, VH);
+  txt('选 择 难 度', VW / 2, 110, TH.green, 46, 'center');
+  txt('难度影响敌军密度、房卡耐久消耗与「好东西」掉率；地狱难度额外刷新红旗召唤敌军', VW / 2, 156, '#8fa07a', 14, 'center');
+  txt('（请先确认已在商城选好装备，这里最后确定难度）', VW / 2, 182, '#7f9a6a', 13, 'center');
+  diffBtns = [];
+  var n = DIFFS.length, w = 240, h = 130, gap = 30;
+  var totalW = n * w + (n - 1) * gap, sx = VW / 2 - totalW / 2, y = 230;
+  for (var i = 0; i < n; i++) {
+    (function (idx) {
+      var bx = sx + idx * (w + gap);
+      var sel = idx === DIFFKEY;
+      var hov = mouse.x > bx && mouse.x < bx + w && mouse.y > y && mouse.y < y + h;
+      rr(bx, y, w, h, sel ? TH.greenD : (hov ? '#1c3320' : '#102014'));
+      rr(bx, y, w, 3, sel ? TH.green : '#2c4a30');
+      txt(DIFFS[idx].name, bx + w / 2, y + 46, sel ? TH.white : TH.gold, 24, 'center');
+      txt(DIFFS[idx].note, bx + w / 2, y + 84, '#cfe0bc', 13, 'center');
+      diffBtns.push({ r: [bx, y, w, h], cb: function () { chooseDiff(idx); } });
+    })(i);
+  }
+  var bbx = VW / 2 - 90, bby = VH - 70, bw = 180, bh = 44;
+  var hov2 = mouse.x > bbx && mouse.x < bbx + bw && mouse.y > bby && mouse.y < bby + bh;
+  rr(bbx, bby, bw, bh, hov2 ? TH.greenD : '#14260f'); rr(bbx, bby, bw, 2, TH.green);
+  txt('返回商城', bbx + bw / 2, bby + 29, hov2 ? TH.white : '#a8b894', 16, 'center');
+  diffBtns.push({ r: [bbx, bby, bw, bh], cb: function () { state = 'shop'; } });
+}
+function chooseDiff(idx) {
+  DIFFKEY = idx; DIFF = DIFFS[idx]; LS = DIFF.lenMul;
+  genWorld(LEVEL);          // 用新难度重建本关世界（保留玩家已购装备与资金）
+  resetRun();
+  spawnEnemies();
+  bullets = []; ebullets = []; grens = []; drops = []; parts = []; corpses = []; deathBoxes = [];
+  cam.x = 0; cam.y = 0; elapsed = 0; shake = 0; holdTimer = 0; ropeReady = false; grenAiming = false;
+  stats = { kills: 0, deaths: 0, killStreak: 0, shots: 0 };
+  bannerT = 1800; bannerText = '难度已设为 ' + DIFFS[idx].name;
+  state = 'shop';
+}
+function drawHome() {
+  var g = ctx.createLinearGradient(0, 0, 0, VH);
+  g.addColorStop(0, '#0a1a12'); g.addColorStop(1, '#1a3a22');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, VW, VH);
+  ctx.fillStyle = '#0e2413';
+  for (var i = 0; i < 10; i++) {
+    ctx.beginPath(); ctx.moveTo(i * 120 - 40, VH);
+    ctx.lineTo(i * 120 + 20, 330 + (i % 3) * 40); ctx.lineTo(i * 120 + 120, VH); ctx.closePath(); ctx.fill();
+  }
+  ctx.fillStyle = '#0b1c0f'; ctx.fillRect(0, VH - 70, VW, 70);
+  txt('枪 林 弹 雨', VW / 2, 150, TH.green, 62, 'center');
+  txt('V 2   ·   战役 · 2D 枪战撤离', VW / 2, 190, '#7f9a6a', 20, 'center');
+
+  homeBtns = [];
+  var defs = [
+    ['新手入门（含教学）', function () { tutorialMode = true; setTip(true); startGame(0); state = 'tutorial'; tutStep = 0; }],
+    ['老手直接开战', function () { tutorialMode = false; setTip(false); openShop(0); }],
+    ['娱乐关卡（跑酷·选关）', function () { funSelLevel = 0; wsMode = 0; state = 'funlevelselect'; }],
+    ['选择关卡', function () { state = 'levelselect'; }],
+    ['操作说明', function () { showHelp = true; }]
+  ];
+  for (var j = 0; j < defs.length; j++) {
+    var bw = 300, bh = 42, bx = (VW - bw) / 2, by = 250 + j * 48;
+    var hov = mouse.x > bx && mouse.x < bx + bw && mouse.y > by && mouse.y < by + bh;
+    rr(bx, by, bw, bh, hov ? TH.greenD : '#14260f');
+    rr(bx, by, bw, 2, TH.green);
+    txt(defs[j][0], VW / 2, by + 28, hov ? TH.white : '#a8b894', 18, 'center');
+    homeBtns.push({ r: [bx, by, bw, bh], cb: defs[j][1] });
+  }
+  txt('难度在「商城选好装备后」再选择（商城右下角「选择难度」）', VW / 2, 215, '#7f9a6a', 13, 'center');
+  txt('目标：向东推进至旗杆，坚守 10 秒，攀爬绳梯登上接应飞机撤离', VW / 2, VH - 22, '#6a8a5a', 13, 'center');
+
+  if (showHelp) {
+    rr(120, 80, VW - 240, VH - 160, '#0c1a0c');
+    rr(120, 80, VW - 240, 3, TH.green);
+    var lines = [
+      '【移动】A / D 左右移动　W 跳跃　S 下蹲（站立不动噪音为 0）',
+      '【疾跑】按住 Shift 疾跑，移动更快，但噪音极大、极易被敌人察觉',
+      '【噪音】跑动噪音大，远处敌人会察觉；按住 S 下蹲慢移噪音极低',
+      '【射击】鼠标控制枪口方向　左键射击　R 换弹',
+      '【手雷】长按 G 显示落点轨迹，松开 G 投掷；跑酷模式手雷无限，战役模式需在商城花 5 金币购买、无初始手雷；无敌护盾期间仍可投弹（仅不能用枪开火）；爆炸范围已增大',
+      '【武器】数字键 1/2/3 切换已拥有武器；Q 收起武器（潜行）；站到掉落武器上按右键拾取（背包满 3 把则不捡）',
+  '【木箱】机枪/手枪/霰弹枪每发 50% 概率击碎，敌方子弹 10% 概率击碎。掉落：5% 超级火箭炮（金色·一次5连发）、10% 手雷、30% 普通武器（含反弹枪）、其余仅破碎',
+  '【火箭炮】火箭炮 / 超级火箭炮可穿透 1 个敌人后爆炸，2 格半径范围内所有敌人直接炸死',
+  '【商城与金币】战役每关开局进入商城：用手币买武器（手枪5/霰弹7/机枪10/火箭筒25，背包最多3把）、弹药（50发=2金）、血包（5金，F键回30血，最多10个）、手雷（5金）。杀敌与破木箱可得金币',
+  '【操作】数字键 1/2/3 切换已拥有武器；战斗中按 B 打开商城补货；血包按 F 使用',
+      '【梯子】靠近梯子按空格登上，W / S 上下，再按空格跳下',
+      '【重生点】地图中段平台有一面旗，站上去停留 5 秒可设为重生点，阵亡后在此复活',
+      '【红旗】复活点附近 10~15 米处插着红旗：你离开复活点（离开判定范围）时，它每秒召唤一个随机兵种（不含抢旗手）；守住复活点可阻止召唤',
+      '【撤离点红旗】抵达撤离点后，远处一面红旗每 10 秒召唤一个随机敌兵（不含抢旗手）进攻，需沿途清剿',
+      '【撤离】抵达东端旗杆坚守 10 秒，绳梯放下后靠近按空格登机',
+      '【敌人】手枪兵 / 霰弹枪兵 / 机枪兵 / 火箭炮兵 / 狙击兵 / 突击兵',
+      '【战役】共 ' + LEVELS.length + ' 关，每关地图不同；第 1 关最简单、最后一关最难',
+      '【娱乐关卡】首页选「娱乐关卡（跑酷·选关）」可选 10 阶难度（攀爬越来越难），自选武器开爬，登顶即胜利'
+    ];
+    txt('操作说明', VW / 2, 118, TH.gold, 22, 'center');
+    for (var k = 0; k < lines.length; k++) txt(lines[k], 156, 160 + k * 26, '#b8c8a0', 14);
+    txt('点击任意处返回', VW / 2, VH - 108, '#6a8a5a', 13, 'center');
+  }
+}
+function drawResult() {
+  ctx.fillStyle = '#07100a'; ctx.fillRect(0, 0, VW, VH);
+  var r = resultInfo;
+  if (r.fun) {
+    txt(r.final ? '跑 酷 通 关' : '登 顶 成 功', VW / 2, 120, TH.green, 54, 'center');
+    txt(r.final ? '你征服了全部 ' + FUN_LEVELS.length + ' 阶险峰，堪称爬山之王！' : '你征服了「' + FUN_LEVELS[r.funLevel].name + '」', VW / 2, 168, '#8fa07a', 16, 'center');
+  } else if (r.final) {
+    txt('战 役 通 关', VW / 2, 120, TH.green, 58, 'center');
+    txt('你穿越了全部 ' + LEVELS.length + ' 关战场，活着回到了后方。', VW / 2, 168, '#8fa07a', 16, 'center');
+  } else {
+    txt(r.win ? '撤 离 成 功' : '任 务 中 止', VW / 2, 130, r.win ? TH.green : TH.red, 54, 'center');
+    txt(r.win ? '你登上了接应飞机，活着离开了这片战场。' : '撤离未完成，战场记录已归档。', VW / 2, 176, '#8fa07a', 16, 'center');
+  }
+  rr(VW / 2 - 200, 210, 400, 150, '#0e1c0e');
+  rr(VW / 2 - 200, 210, 400, 2, TH.green);
+  txt('战斗耗时　' + r.time + ' 秒', VW / 2 - 170, 250, TH.white, 16);
+  txt('击杀敌人　' + r.kills + ' 名', VW / 2 - 170, 284, TH.white, 16);
+  txt('阵亡次数　' + r.deaths + ' 次', VW / 2 - 170, 318, TH.white, 16);
+  txt('评价　' + rank(r), VW / 2 - 170, 352, TH.gold, 16);
+  resultBtns = [];
+  var defs = [['返回首页', function () { state = 'home'; }]];
+  if (r.fun) {
+    if (!r.final) defs.unshift(['下一阶', function () { startFunGame(funWeapon, r.funLevel + 1); }]);
+    defs.unshift(['重爬本阶', function () { startFunGame(funWeapon, r.funLevel); }]);
+  } else {
+    if (!r.final) defs.unshift(['下一关', function () { nextLevel(); }]);
+    defs.unshift(['再来一局', function () { openShop(LEVEL); }]);
+  }
+  var n = defs.length;
+  var bw = 200, bh = 46, gap = 20, totalW = n * bw + (n - 1) * gap;
+  var startX = VW / 2 - totalW / 2, by = 400;
+  for (var i = 0; i < n; i++) {
+    var bx = startX + i * (bw + gap);
+    var hov = mouse.x > bx && mouse.x < bx + bw && mouse.y > by && mouse.y < by + bh;
+    rr(bx, by, bw, bh, hov ? TH.greenD : '#14260f');
+    rr(bx, by, bw, 2, TH.green);
+    txt(defs[i][0], bx + bw / 2, by + 30, hov ? TH.white : '#a8b894', 17, 'center');
+    resultBtns.push({ r: [bx, by, bw, bh], cb: defs[i][1] });
+  }
+}
+function drawTutorial() {
+  ctx.fillStyle = 'rgba(6,14,8,0.93)'; ctx.fillRect(0, 0, VW, VH);
+  var px = 80, py = 64, pw = VW - 160, ph = VH - 200;
+  rr(px, py, pw, ph, '#0c1a0c');
+  rr(px, py, pw, 3, TH.green);
+  if (tutStep >= TUT_PAGES.length) tutStep = TUT_PAGES.length - 1;
+  var p = TUT_PAGES[tutStep];
+  txt('新兵训练  ' + (tutStep + 1) + ' / ' + TUT_PAGES.length, VW / 2, py + 34, TH.gold, 20, 'center');
+  txt(p.title, VW / 2, py + 72, TH.green, 28, 'center');
+  for (var i = 0; i < p.lines.length; i++) txt(p.lines[i], px + 40, py + 122 + i * 30, '#cfe0bc', 16);
+  tutBtns = [];
+  var by = VH - 110, bh = 44, bw = 170;
+  function tBtn(label, cb, bx, w) {
+    var hov = mouse.x > bx && mouse.x < bx + w && mouse.y > by && mouse.y < by + bh;
+    rr(bx, by, w, bh, hov ? TH.greenD : '#14260f'); rr(bx, by, w, 2, TH.green);
+    txt(label, bx + w / 2, by + 29, hov ? TH.white : '#a8b894', 17, 'center');
+    tutBtns.push({ r: [bx, by, w, bh], cb: cb });
+  }
+  var last = tutStep >= TUT_PAGES.length - 1;
+  if (tutStep > 0) tBtn('上一步', function () { tutStep--; }, VW / 2 - 280, bw);
+  if (!last) tBtn('下一步', function () { tutStep++; }, VW / 2 + 110, bw);
+  else tBtn('开始战斗', function () { state = 'play'; showTutorial = false; }, VW / 2 + 90, 200);
+}
+
+function drawLevelSelect() {
+  ctx.fillStyle = '#07100a'; ctx.fillRect(0, 0, VW, VH);
+  ctx.fillStyle = '#0e2413';
+  for (var i = 0; i < 10; i++) {
+    ctx.beginPath(); ctx.moveTo(i * 120 - 40, VH);
+    ctx.lineTo(i * 120 + 20, 360 + (i % 3) * 40); ctx.lineTo(i * 120 + 120, VH); ctx.closePath(); ctx.fill();
+  }
+  txt('选 择 关 卡', VW / 2, 64, TH.green, 40, 'center');
+  txt('第 1 关最简单 · 第 ' + LEVELS.length + ' 关最难 · 每关地图与敌人都不同', VW / 2, 98, '#8fa07a', 15, 'center');
+  lsBtns = [];
+  var cols = 5, cw = 150, ch = 86, gap = 18;
+  var totalW = cols * cw + (cols - 1) * gap;
+  var startX = (VW - totalW) / 2, startY = 140;
+  for (var j = 0; j < LEVELS.length; j++) {
+    (function (lv) {
+      var col = lv % cols, row = Math.floor(lv / cols);
+      var bx = startX + col * (cw + gap), by = startY + row * (ch + gap);
+      var hov = mouse.x > bx && mouse.x < bx + cw && mouse.y > by && mouse.y < by + ch;
+      var stars = Math.min(5, Math.ceil((lv + 1) / 2));
+      rr(bx, by, cw, ch, hov ? TH.greenD : '#102014');
+      rr(bx, by, cw, 2, TH.green);
+      txt('第 ' + (lv + 1) + ' 关', bx + cw / 2, by + 28, hov ? TH.white : '#cfe0bc', 18, 'center');
+      txt(LEVELS[lv].name, bx + cw / 2, by + 52, TH.accent, 15, 'center');
+      var sstr = '', s;
+      for (s = 0; s < stars; s++) sstr += '★';
+      for (; s < 5; s++) sstr += '☆';
+      txt(sstr, bx + cw / 2, by + 74, TH.gold, 15, 'center');
+      lsBtns.push({ r: [bx, by, cw, ch], cb: function () { tutorialMode = false; setTip(false); openShop(lv); } });
+    })(j);
+  }
+  txt('进入商城选好装备后，再在商城里选择难度', VW / 2, 430, '#7f9a6a', 13, 'center');
+  var bbx = VW / 2 - 90, bby = VH - 66, bw = 180, bh = 44;
+  var hov2 = mouse.x > bbx && mouse.x < bbx + bw && mouse.y > bby && mouse.y < bby + bh;
+  rr(bbx, bby, bw, bh, hov2 ? TH.greenD : '#14260f'); rr(bbx, bby, bw, 2, TH.green);
+  txt('返回首页', bbx + bw / 2, bby + 29, hov2 ? TH.white : '#a8b894', 17, 'center');
+  lsBtns.push({ r: [bbx, bby, bw, bh], cb: function () { state = 'home'; } });
+}
+
+function drawFunLevelSelect() {
+  ctx.fillStyle = '#07100a'; ctx.fillRect(0, 0, VW, VH);
+  ctx.fillStyle = '#0e2413';
+  for (var i = 0; i < 10; i++) {
+    ctx.beginPath(); ctx.moveTo(i * 120 - 40, VH);
+    ctx.lineTo(i * 120 + 20, 360 + (i % 3) * 40); ctx.lineTo(i * 120 + 120, VH); ctx.closePath(); ctx.fill();
+  }
+  txt('娱 乐 关 卡 · 选 关', VW / 2, 58, TH.green, 40, 'center');
+  txt('难度 = 攀爬能力（平台越窄、落差越大越难），敌方实力恒定 · 共 ' + FUN_LEVELS.length + ' 阶', VW / 2, 92, '#8fa07a', 14, 'center');
+  flsBtns = [];
+  var cols = 5, cw = 150, ch = 92, gap = 18;
+  var totalW = cols * cw + (cols - 1) * gap;
+  var startX = (VW - totalW) / 2, startY = 124;
+  for (var j = 0; j < FUN_LEVELS.length; j++) {
+    (function (lv) {
+      var col = lv % cols, row = Math.floor(lv / cols);
+      var bx = startX + col * (cw + gap), by = startY + row * (ch + gap);
+      var hov = mouse.x > bx && mouse.x < bx + cw && mouse.y > by && mouse.y < by + ch;
+      rr(bx, by, cw, ch, hov ? TH.greenD : '#102014');
+      rr(bx, by, cw, 2, TH.green);
+      txt('第 ' + (lv + 1) + ' 阶', bx + cw / 2, by + 26, hov ? TH.white : '#cfe0bc', 18, 'center');
+      txt(FUN_LEVELS[lv].name, bx + cw / 2, by + 50, TH.accent, 15, 'center');
+      txt(FUN_LEVELS[lv].note, bx + cw / 2, by + 72, '#9ab08a', 11, 'center');
+      flsBtns.push({ r: [bx, by, cw, ch], cb: function () { funSelLevel = lv; wsMode = 0; state = 'weaponselect'; } });
+    })(j);
+  }
+  var bbx = VW / 2 - 90, bby = VH - 62, bw = 180, bh = 44;
+  var hov2 = mouse.x > bbx && mouse.x < bbx + bw && mouse.y > bby && mouse.y < bby + bh;
+  rr(bbx, bby, bw, bh, hov2 ? TH.greenD : '#14260f'); rr(bbx, bby, bw, 2, TH.green);
+  txt('返回首页', bbx + bw / 2, bby + 29, hov2 ? TH.white : '#a8b894', 17, 'center');
+  flsBtns.push({ r: [bbx, bby, bw, bh], cb: function () { state = 'home'; } });
+}
+
+function drawWeaponSelect() {
+  var g = ctx.createLinearGradient(0, 0, 0, VH);
+  g.addColorStop(0, '#0a1a12'); g.addColorStop(1, '#1a3a22');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, VW, VH);
+  if (wsMode === 0) {
+    txt('娱 乐 关 卡 · 第 ' + (funSelLevel + 1) + ' 阶', VW / 2, 64, TH.green, 42, 'center');
+    txt('「' + FUN_LEVELS[funSelLevel].name + '」— ' + FUN_LEVELS[funSelLevel].note, VW / 2, 102, TH.accent, 15, 'center');
+    txt('攀爬难度随阶递增（平台更窄、落差更大），敌方实力恒定。选一把武器开爬！', VW / 2, 130, '#9ab08a', 14, 'center');
+    txt('（娱乐关卡恒为简单难度，六把武器任选其一，备弹充足、子弹无限；超级火箭炮可一次 5 连发、反弹枪可弹墙溅射）', VW / 2, 152, '#7f9a6a', 13, 'center');
+  } else {
+    txt('简 单 模 式 · 选 武 器', VW / 2, 64, TH.green, 42, 'center');
+    txt('第 ' + (wsLevel + 1) + ' 关 · ' + LEVELS[wsLevel].name, VW / 2, 102, TH.accent, 15, 'center');
+    txt('简单难度开局可自选武器，备弹 500、按枪械正常消耗；后续关卡沿用所选武器。', VW / 2, 130, '#9ab08a', 14, 'center');
+    txt('（超级火箭炮、反弹枪只能从木箱开出，不在此列）', VW / 2, 152, '#7f9a6a', 13, 'center');
+  }
+  wsBtns = [];
+  var isFun = (wsMode === 0);
+  // 跑酷关额外提供「超级火箭炮」「反弹枪」直接选择（子弹无限）；战役简单模式仍只能从木箱开出
+  var keys = isFun ? ['pistol', 'shotgun', 'mg', 'rocket', 'urocket', 'bounce'] : ['pistol', 'shotgun', 'mg', 'rocket'];
+  var cw = isFun ? 142 : 200, ch = 220, gap = isFun ? 14 : 22, totalW = keys.length * cw + (keys.length - 1) * gap;
+  var sx = (VW - totalW) / 2, sy = 170;
+  for (var i = 0; i < keys.length; i++) {
+    (function (wk) {
+      var w = WEAPONS[wk];
+      var bx = sx + i * (cw + gap), by = sy;
+      var hov = mouse.x > bx && mouse.x < bx + cw && mouse.y > by && mouse.y < by + ch;
+      rr(bx, by, cw, ch, hov ? TH.greenD : '#102014');
+      rr(bx, by, cw, 3, TH.green);
+      txt(w.name, bx + cw / 2, by + 38, hov ? TH.white : TH.gold, 24, 'center');
+      var line4 = w.volley ? ('一次 ' + w.volley + ' 连发') : (w.auto ? '全自动' : '手动射击');
+      var line5 = w.bounce ? ('反弹 ×' + w.bounce + ' · 范围 ' + w.splash + 'm') : (w.explosive ? ('⚠ 爆炸' + (w.pierce ? ' · 穿透' + w.pierce : '') + (w.autoReload ? ' · 自动换弹' : '')) : (w.autoReload ? '自动换弹' : '普通弹'));
+      var lines = [
+        '弹匣 ' + w.mag + ' 发',
+        '伤害 ' + w.dmg + (w.pellets > 1 ? ' ×' + w.pellets : '') + (w.volley ? (' ×' + w.volley) : ''),
+        '射程 ' + w.range,
+        line4,
+        line5
+      ];
+      for (var k = 0; k < lines.length; k++) if (lines[k]) txt(lines[k], bx + cw / 2, by + 74 + k * 24, '#cfe0bc', 14, 'center');
+      rr(bx + 20, by + ch - 44, cw - 40, 32, hov ? TH.green : '#1c3320');
+      txt(wsMode === 0 ? '开始跑酷' : '开始战斗', bx + cw / 2, by + ch - 23, hov ? TH.white : '#a8b894', 15, 'center');
+      wsBtns.push({ r: [bx, by, cw, ch], cb: function () { if (wsMode === 0) startFunGame(wk, funSelLevel); else startCampaign(wk, wsLevel); } });
+    })(keys[i]);
+  }
+  var bbx = VW / 2 - 90, bby = VH - 60, bw = 180, bh = 42;
+  var hov2 = mouse.x > bbx && mouse.x < bbx + bw && mouse.y > bby && mouse.y < bby + bh;
+  rr(bbx, bby, bw, bh, hov2 ? TH.greenD : '#14260f'); rr(bbx, bby, bw, 2, TH.green);
+  txt('返回', bbx + bw / 2, bby + 28, hov2 ? TH.white : '#a8b894', 16, 'center');
+  wsBtns.push({ r: [bbx, bby, bw, bh], cb: function () { state = wsBack; } });
+}
+
+function drawShop() {
+  var g = ctx.createLinearGradient(0, 0, 0, VH);
+  g.addColorStop(0, '#10160c'); g.addColorStop(1, '#1c2a14');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, VW, VH);
+  shopBtns = [];
+  txt(shopPause ? '商 城（战斗中 · 按 ESC 继续）' : '商 城 · 第 ' + (shopLevel + 1) + ' 关', VW / 2, 40, TH.gold, 32, 'center');
+  txt('金币 ' + player.coins + '　玩家等级 ' + playerLevel + '　武器栏 ' + barFilled() + '/3 · 背包 ' + player.bag.length + '/' + bagCap() + '　房卡 ' + cardTotal() + '（卡包 ' + cardPackTotal() + '/' + CARD_PACK_CAP + '）　血包 ' + player.healthPacks + '/' + MAX_HEALTHPACKS + '　手雷 ' + player.grens, VW / 2, 70, TH.white, 15, 'center');
+
+  // 武器购买
+  var guns = ['pistol', 'shotgun', 'mg', 'rocket'];
+  var bw = 210, gap = 12, bx = (VW - (guns.length * bw + (guns.length - 1) * gap)) / 2, by = 96, bh = 80;
+  for (var i = 0; i < guns.length; i++) {
+    var wk = guns[i], w = WEAPONS[wk];
+    var owned = ownsGun(wk);
+    var full = !canCarry(wk) && !owned;
+    var price = SHOP_PRICES[wk];
+    var can = !owned && !full && player.coins >= price;
+    var x = bx + i * (bw + gap), y = by;
+    rr(x, y, bw, bh, owned ? '#16331c' : (can ? '#102014' : '#1a1a14'));
+    rr(x, y, bw, 3, owned ? TH.green : (can ? TH.green : '#333'));
+    txt(w.name, x + bw / 2, y + 26, owned ? TH.green : (can ? TH.gold : '#666'), 20, 'center');
+    txt('伤害 ' + w.dmg + (w.pellets > 1 ? '×' + w.pellets : '') + ' · 弹匣 ' + w.mag, x + bw / 2, y + 50, '#cfe0bc', 12, 'center');
+    if (owned) txt('✔ 已拥有', x + bw / 2, y + 74, TH.green, 15, 'center');
+    else if (full) txt('背包已满', x + bw / 2, y + 74, '#a05a4a', 15, 'center');
+    else txt('购买　' + price + ' 金', x + bw / 2, y + 74, can ? TH.gold : '#777', 15, 'center');
+    (function (wk2, can2) { shopBtns.push({ r: [x, y, bw, bh], cb: function () { if (can2) buyWeapon(wk2); } }); })(wk, can);
+  }
+
+  // 已拥有武器：补弹
+  var ay = by + bh + 14, ah = 38;
+  var ownedG = ownedGuns();
+  txt('已拥有武器 · 补弹（50 发 = ' + SHOP_PRICES.ammo + ' 金）', bx, ay - 4, '#9ab08a', 13);
+  for (var j = 0; j < ownedG.length; j++) {
+    var wmk = ownedG[j], wm = WEAPONS[wmk];
+    var x2 = bx + (j % 4) * (bw + gap), y2 = ay + Math.floor(j / 4) * (ah + 8);
+    var canA = player.coins >= SHOP_PRICES.ammo;
+    var bt = player.bulletTier[wmk] || 1;
+    rr(x2, y2, bw, ah, canA ? '#102014' : '#1a1a14');
+    rr(x2, y2, bw, 2, canA ? TH.green : '#333');
+    txt(wm.name + ' 补弹+50 (' + SHOP_PRICES.ammo + '金)', x2 + bw / 2, y2 + 14, canA ? TH.gold : '#777', 13, 'center');
+    txt(bt >= 2 ? '★ 二级子弹（伤害 ×1.5）' : '一级子弹 · 右键升级二级（' + BULLET_UPGRADE_COST + '金）', x2 + bw / 2, y2 + 30, bt >= 2 ? '#ffcf3f' : '#8ab0c8', 11, 'center');
+    (function (canA2, gk) { shopBtns.push({ r: [x2, y2, bw, ah], cb: function () { if (canA2) buyAmmo(); }, rcb: function () { upgradeBullet(gk); } }); })(canA, wmk);
+  }
+
+  // 道具 / 装备（消耗品 + 复活币 + 胸挂，网格排布）
+  var pItems = [
+    { name: '血包 · +700 血', sub: (player.hasRig ? ('持 ' + player.healthPacks + '/' + MAX_HEALTHPACKS) : '需胸挂') + ' · ' + SHOP_PRICES.health + ' 金', can: player.hasRig && player.healthPacks < MAX_HEALTHPACKS && player.coins >= SHOP_PRICES.health, cb: buyHealth, col: '#c0606a' },
+    { name: '手雷 · 1 颗', sub: '持 ' + player.grens + ' · ' + SHOP_PRICES.grenade + ' 金', can: player.coins >= SHOP_PRICES.grenade, cb: buyGrenade },
+    { name: '弹药 ×50', sub: '备弹 ' + player.reserve + ' · ' + SHOP_PRICES.ammo + ' 金', can: player.coins >= SHOP_PRICES.ammo, cb: buyAmmo },
+    { name: '复活币 · 死亡自动用', sub: '持 ' + player.reviveCoins + '/' + REVIVE_COIN_MAX + ' · ' + REVIVE_COIN_PRICE + ' 金', can: player.reviveCoins < REVIVE_COIN_MAX && player.coins >= REVIVE_COIN_PRICE, cb: buyReviveCoin, col: '#e0c040' },
+    { name: '胸挂 · 带它才能血包', sub: player.hasRig ? '已装备' : (RIG_PRICE + ' 金'), can: !player.hasRig && player.coins >= RIG_PRICE, cb: buyRig, col: '#7fd0e0' },
+    { name: '一级护甲', sub: armorSub(1), can: armorCan(1), cb: function () { buyArmor(1); }, col: '#9fd0c0' },
+    { name: '二级护甲', sub: armorSub(2), can: armorCan(2), cb: function () { buyArmor(2); }, col: '#9fd0c0' },
+    { name: '三级护甲', sub: armorSub(3), can: armorCan(3), cb: function () { buyArmor(3); }, col: '#9fd0c0' }
+  ];
+  var piw = 224, pig = 10, pih = 46, pcols = 4;
+  var pX = (VW - (pcols * piw + (pcols - 1) * pig)) / 2;
+  var pY = ay + ah + 14;
+  for (var k = 0; k < pItems.length; k++) {
+    var it = pItems[k], col = k % pcols, row = Math.floor(k / pcols);
+    var x3 = pX + col * (piw + pig), y3 = pY + row * (pih + 8);
+    rr(x3, y3, piw, pih, it.can ? '#102014' : '#1a1a14');
+    rr(x3, y3, piw, 2, it.can ? (it.col || TH.green) : '#333');
+    txt(it.name, x3 + piw / 2, y3 + 20, it.can ? TH.gold : '#777', 14, 'center');
+    txt(it.sub, x3 + piw / 2, y3 + 38, '#9ab08a', 11, 'center');
+    (function (it2) { shopBtns.push({ r: [x3, y3, piw, pih], cb: function () { if (it2.can) it2.cb(); } }); })(it);
+  }
+  var gridH = (Math.ceil(pItems.length / pcols)) * (pih + 8) - 8;
+
+  // 房卡购买（仅战役；1~6 级全可买）
+  var cy = pY + gridH + 12, cch = 48;
+  if (!funMode) {
+    txt('购买房卡（开启房卡房门用 · 1~6 级）', bx, cy - 4, '#9ab08a', 13);
+    var cw2 = 148, cg2 = 8, cbx = (VW - (6 * cw2 + 5 * cg2)) / 2;
+    for (var ci = 1; ci <= 6; ci++) {
+      var cprice = CARD_PRICES[ci], ccan = player.coins >= cprice;
+      var cx2 = cbx + (ci - 1) * (cw2 + cg2), cy2 = cy + 6;
+      rr(cx2, cy2, cw2, cch, ccan ? '#102014' : '#1a1a14');
+      rr(cx2, cy2, cw2, 2, ccan ? cardCol(ci) : '#333');
+      rr(cx2 + 8, cy2 + 9, 14, 14, cardCol(ci));
+      txt('K' + ci + ' 房卡', cx2 + cw2 / 2 + 8, cy2 + 20, ccan ? TH.gold : '#777', 13, 'center');
+      txt(cprice + ' 金', cx2 + cw2 / 2, cy2 + 40, '#9ab08a', 12, 'center');
+      (function (lv, can) { shopBtns.push({ r: [cx2, cy2, cw2, cch], cb: function () { if (can) buyCard(lv); } }); })(ci, ccan);
+    }
+  }
+
+  // 背包升级（等级 = 储物枪数；每升一级 +20 金；受玩家等级门控）
+  var byu = cy + 6 + cch + 12, bhu = 34;
+  var maxAl = maxBagLvByLevel(playerLevel);
+  txt('背包等级 ' + player.bagLv + ' / 6（储物容量 ' + bagCap() + ' 把枪 · 每级 +20 金）　玩家等级 ' + playerLevel, bx, byu - 6, '#9ab08a', 13);
+  if (player.bagLv < 6) {
+    var nlv = player.bagLv + 1, cost = BAG_COST[nlv], canU = player.coins >= cost;
+    var locked = nlv > maxAl;
+    var reqLv = nlv >= 6 ? 50 : (nlv >= 5 ? 30 : 10);
+    rr(bx, byu, 460, bhu, locked ? '#1a1410' : (canU ? '#102014' : '#1a1a14'));
+    rr(bx, byu, 460, 2, locked ? '#a05a4a' : (canU ? TH.green : '#333'));
+    txt('升级背包 → ' + nlv + ' 级（容量 ' + nlv + ' 把枪）', bx + 230, byu + 12, locked ? '#a05a4a' : (canU ? TH.gold : '#777'), 14, 'center');
+    if (locked) txt('需玩家等级 ' + reqLv + ' 级，暂不可购买', bx + 230, byu + 28, '#a05a4a', 12, 'center');
+    else txt('花费 ' + cost + ' 金', bx + 230, byu + 28, '#9ab08a', 12, 'center');
+    (function (nlv2, cost2) { shopBtns.push({ r: [bx, byu, 460, bhu], cb: function () { buyBag(nlv2, cost2); } }); })(nlv, cost);
+  } else {
+    rr(bx, byu, 460, bhu, '#16331c');
+    txt('背包已满级（6 级 · 容量 6 把枪）', bx + 230, byu + 22, TH.green, 14, 'center');
+  }
+
+  // 底部操作条：开始/继续（中）、仓库（左）、选择难度（右）动态贴底，避免与上方重叠
+  var footY = byu + bhu + 16;
+  var whx = 24, why = footY, whw = 150, whh = 40;
+  rr(whx, why, whw, whh, '#24304a'); rr(whx, why, whw, 2, '#7fd0e0');
+  txt('仓 库', whx + whw / 2, why + 17, '#cdeaff', 16, 'center');
+  txt('(跨关存枪/变卖物)', whx + whw / 2, why + 33, '#9ab', 10, 'center');
+  shopBtns.push({ r: [whx, why, whw, whh], cb: function () { state = 'warehouse'; } });
+
+  if (!shopPause) {
+    var dbx = VW - 24 - 150, dby = footY, dbw = 150, dbh = 40;
+    rr(dbx, dby, dbw, dbh, '#3a2a14'); rr(dbx, dby, dbw, 2, '#e0c040');
+    txt('选 择 难 度', dbx + dbw / 2, dby + 17, '#ffe7b0', 16, 'center');
+    txt('当前 ' + DIFFS[DIFFKEY].name, dbx + dbw / 2, dby + 33, DIFFKEY === 2 ? '#ff9a9a' : (DIFFKEY === 1 ? '#ffe7b0' : '#cfe0bc'), 12, 'center');
+    shopBtns.push({ r: [dbx, dby, dbw, dbh], cb: function () { state = 'diffselect'; } });
+  }
+
+  var sbw = 260, sbx = (VW - sbw) / 2, sby = footY, sbh = 40;
+  var canStart = barFilled() > 0;
+  rr(sbx, sby, sbw, sbh, canStart ? '#16331c' : '#1a1a14');
+  rr(sbx, sby, sbw, 2, canStart ? TH.green : '#333');
+  txt(shopPause ? '继续战斗' : '开始战斗', sbx + sbw / 2, sby + 26, canStart ? TH.white : '#777', 18, 'center');
+  shopBtns.push({ r: [sbx, sby, sbw, sbh], cb: function () {
+    if (!canStart) return;
+    if (player.bar.indexOf(player.wp) < 0) pickActiveWp();
+    if (!shopPause) { bannerT = 2200; bannerText = '第 ' + (shopLevel + 1) + ' 关 · ' + LEVELS[shopLevel].name; }
+    state = 'play';
+  } });
+}
+
+// 仓库界面（从商城左下角按钮进入）：存/取武器与变卖物，跨关保留
+function drawWarehouse() {
+  whBtns = [];
+  var g = ctx.createLinearGradient(0, 0, 0, VH);
+  g.addColorStop(0, '#0e1420'); g.addColorStop(1, '#1a2438');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, VW, VH);
+  txt('仓 库（跨关保留 · 仅存武器 + 变卖物 · ESC 返回商城）', VW / 2, 34, '#7fd0e0', 24, 'center');
+  txt('金币 ' + player.coins, VW / 2, 58, TH.white, 14, 'center');
+  txt('提示：仓库内【右键】任意武器/变卖物 = 直接卖出换金币', VW / 2, 74, '#ffcf6a', 13, 'center');
+
+  var lx = 24, lw = 452;
+  // 左：当前持有（可入仓）
+  txt('— 当前持有（点击入仓）—', lx, 86, TH.accent, 15);
+  var ownedG = ownedGuns();
+  var y = 98;
+  if (ownedG.length === 0) { txt('（空）', lx + 8, y + 14, '#888', 13); y += 24; }
+  for (var i = 0; i < ownedG.length; i++) {
+    var wk = ownedG[i], w = WEAPONS[wk];
+    rr(lx, y, lw, 28, '#102030');
+    txt(w.name + '（' + (w.kind === 'pistol' ? '手枪' : '主武器') + (player.bar.indexOf(wk) >= 0 ? ' · 在武器栏' : (player.bag.indexOf(wk) >= 0 ? ' · 在背包' : '')) + '）', lx + 8, y + 19, '#cfe0ff', 13);
+    (function (wk2) { whBtns.push({ r: [lx + lw - 110, y + 2, 100, 24], cb: function () { whDepositGun(wk2); }, rcb: function () { sellOwnedGun(wk2); } }); })(wk);
+    rr(lx + lw - 110, y + 2, 100, 24, '#244'); txt('入仓', lx + lw - 60, y + 18, '#bdf', 12, 'center');
+    y += 32;
+  }
+  // 变卖物入仓
+  y += 6;
+  txt('— 变卖物（点击入仓）—', lx, y + 4, TH.accent, 15); y += 22;
+  for (var lv = 1; lv <= 6; lv++) {
+    var cnt = player.sell[lv] || 0; if (cnt <= 0) continue;
+    rr(lx, y, lw, 24, '#102030');
+    rr(lx + 4, y + 4, 16, 16, cardCol(lv));
+    txt('Lv' + lv + ' 变卖物 ×' + cnt, lx + 26, y + 16, '#cfe0ff', 13);
+    (function (lv2) { whBtns.push({ r: [lx + lw - 110, y + 1, 100, 22], cb: function () { whDepositSell(lv2); }, rcb: function () { bagSellSell(lv2); } }); })(lv);
+    rr(lx + lw - 110, y + 1, 100, 22, '#244'); txt('入仓', lx + lw - 60, y + 16, '#bdf', 12, 'center');
+    y += 28;
+  }
+
+  // 右：仓库（可取出）
+  var rx = 500, rw = 436;
+  txt('— 仓库（点击取出）—', rx, 86, TH.accent, 15);
+  var ry = 98;
+  txt('武器：', rx, ry + 2, '#9ab08a', 13); ry += 18;
+  if (warehouse.guns.length === 0) { txt('（空）', rx + 8, ry + 12, '#888', 13); ry += 24; }
+  for (var wi = 0; wi < warehouse.guns.length; wi++) {
+    var g2 = warehouse.guns[wi];
+    rr(rx, ry, rw, 26, '#1a1a2a');
+    txt(WEAPONS[g2].name, rx + 8, ry + 18, '#cfe0bc', 13);
+    (function (idx, g2c) { whBtns.push({ r: [rx + rw - 120, ry + 2, 112, 22], cb: function () { whWithdrawGun(idx); }, rcb: function () { whSellGun(g2c); } }); })(wi, g2);
+    rr(rx + rw - 120, ry + 2, 112, 22, '#244'); txt('取出', rx + rw - 64, ry + 17, '#bdf', 12, 'center');
+    ry += 30;
+  }
+  ry += 6;
+  txt('变卖物：', rx, ry + 2, '#9ab08a', 13); ry += 18;
+  var anyS = false;
+  for (var lv3 = 1; lv3 <= 6; lv3++) {
+    var c3 = warehouse.sell[lv3] || 0; if (c3 <= 0) continue;
+    anyS = true;
+    rr(rx, ry, rw, 24, '#1a1a2a');
+    rr(rx + 4, ry + 4, 16, 16, cardCol(lv3));
+    txt('Lv' + lv3 + ' 变卖物 ×' + c3, rx + 26, ry + 16, '#cfe0bc', 13);
+    (function (lv4) { whBtns.push({ r: [rx + rw - 120, ry + 1, 112, 22], cb: function () { whWithdrawSell(lv4); }, rcb: function () { whSellSell(lv4); } }); })(lv3);
+    rr(rx + rw - 120, ry + 1, 112, 22, '#244'); txt('取出', rx + rw - 64, ry + 16, '#bdf', 12, 'center');
+    ry += 28;
+  }
+  if (!anyS) txt('（空）', rx + 8, ry + 12, '#888', 13);
+
+  // 房卡 / 卡包（仓库管理：把房卡装入卡包才能 V 开门）
+  var cy = Math.max(y, ry) + 16;
+  var hw = (VW / 2 - 48), hxL = 24, hxR = VW / 2 + 24;
+  txt('— 房卡（仓库）· 点击装入卡包 —', hxL, cy, TH.accent, 15);
+  txt('— 卡包（开门用 · 走近门按 V）· 点击取出 —', hxR, cy, TH.accent, 15);
+  cy += 18;
+  for (var cl = 1; cl <= 6; cl++) {
+    var co = player.cards[cl] ? player.cards[cl].length : 0;
+    rr(hxL, cy, hw, 22, '#102030');
+    rr(hxL + 4, cy + 4, 14, 14, cardCol(cl));
+    txt('K' + cl + ' ×' + co + (co ? (' · 耐久 ' + player.cards[cl].join('/')) : ''), hxL + 24, cy + 15, '#cfe0ff', 12);
+    if (co > 0) {
+      (function (lv2) { whBtns.push({ r: [hxL + hw - 92, cy, 88, 22], cb: function () { loadCardToPack(lv2); } }); })(cl);
+      rr(hxL + hw - 92, cy, 88, 22, cardPackTotal() < CARD_PACK_CAP ? '#244' : '#333');
+      txt('装入卡包', hxL + hw - 48, cy + 15, '#bdf', 12, 'center');
+    }
+    var pn = player.cardPack[cl] ? player.cardPack[cl].length : 0;
+    rr(hxR, cy, hw, 22, '#1a1a2a');
+    rr(hxR + 4, cy + 4, 14, 14, cardCol(cl));
+    txt('K' + cl + ' ×' + pn + (pn ? (' · 耐久 ' + player.cardPack[cl].join('/')) : ''), hxR + 24, cy + 15, '#cfe0bc', 12);
+    if (pn > 0) {
+      (function (lv2) { whBtns.push({ r: [hxR + hw - 92, cy, 88, 22], cb: function () { unloadCardFromPack(lv2); } }); })(cl);
+      rr(hxR + hw - 92, cy, 88, 22, '#242'); txt('取出', hxR + hw - 48, cy + 15, '#bdf', 12, 'center');
+    }
+    cy += 24;
+  }
+  txt('卡包容量 ' + cardPackTotal() + '/' + CARD_PACK_CAP + '　·　每张房卡耐久 ' + CARD_DURA + '（简单/困难开门 -2 · 地狱 -3 · 耐久耗尽作废；只剩 1 点也能强行开门）', VW / 2, cy + 6, '#9ab08a', 12, 'center');
+}
+
+function rank(r) {
+  if (!r.win) return '—';
+  var s = 100 - r.deaths * 8 + r.kills * 2;  if (s > 140) return 'S · 兵王';
+  if (s > 110) return 'A · 老兵';
+  if (s > 80) return 'B · 熟练';
+  return 'C · 幸存者';
+}
+function drawPause() {
+  ctx.fillStyle = 'rgba(6,14,8,0.78)'; ctx.fillRect(0, 0, VW, VH);
+  txt('已 暂 停', VW / 2, 180, TH.green, 46, 'center');
+  pauseBtns = [];
+  var defs = [['继续战斗', function () { state = 'play'; }], ['重新开始', function () { startGame(); }],
+              ['放弃撤离', function () { giveUp(); }], ['返回首页', function () { state = 'home'; }]];
+  for (var i = 0; i < defs.length; i++) {
+    var bw = 240, bh = 42, bx = (VW - bw) / 2, by = 230 + i * 54;
+    var hov = mouse.x > bx && mouse.x < bx + bw && mouse.y > by && mouse.y < by + bh;
+    rr(bx, by, bw, bh, hov ? TH.greenD : '#14260f');
+    txt(defs[i][0], VW / 2, by + 28, hov ? TH.white : '#a8b894', 16, 'center');
+    pauseBtns.push({ r: [bx, by, bw, bh], cb: defs[i][1] });
+  }
+}
+
+/* ===================== 主循环 ===================== */
+var lastT = 0;
+function frame(ts) {
+  var dt = Math.min(48, ts - lastT || 16);
+  lastT = ts;
+
+  if (state === 'play') update(dt);
+  else if (just['Escape'] && state === 'pause') state = 'play';
+  else if (just['Escape'] && (state === 'tutorial' || state === 'levelselect' || state === 'weaponselect' || state === 'funlevelselect')) state = 'home';
+  else if (just['Escape'] && state === 'shop') state = shopPause ? 'play' : 'home';
+  else if (just['Escape'] && state === 'bag') state = 'play';
+  else if (just['KeyE'] && state === 'bag') state = 'play';
+  else if (just['Escape'] && state === 'warehouse') state = 'shop';
+
+  ctx.save();
+  if (shake > 0.4) ctx.translate((Math.random() * 2 - 1) * shake * 0.4, (Math.random() * 2 - 1) * shake * 0.4);
+
+  if (state === 'home') drawHome();
+  else if (state === 'tutorial') drawTutorial();
+  else if (state === 'levelselect') drawLevelSelect();
+  else if (state === 'funlevelselect') drawFunLevelSelect();
+  else if (state === 'weaponselect') drawWeaponSelect();
+  else if (state === 'diffselect') drawDiffSelect();
+  else if (state === 'shop') drawShop();
+  else if (state === 'warehouse') drawWarehouse();
+  else if (state === 'dead') { drawWorld(); drawHUD(); drawDeathMenu(); }
+  else if (state === 'bag') { drawWorld(); drawHUD(); drawBag(); }
+  else {
+    drawWorld();
+    drawHUD();
+    drawBanner();
+    if (state === 'pause') drawPause();
+    if (state === 'result') drawResult();
+  }
+  ctx.restore();
+
+  var btnList = state === 'home' ? homeBtns
+    : state === 'pause' ? pauseBtns
+    : state === 'result' ? resultBtns
+    : state === 'tutorial' ? tutBtns
+    : state === 'levelselect' ? lsBtns
+    : state === 'funlevelselect' ? flsBtns
+    : state === 'weaponselect' ? wsBtns
+    : state === 'diffselect' ? diffBtns
+    : state === 'shop' ? shopBtns
+    : state === 'warehouse' ? whBtns
+    : state === 'dead' ? deadBtns
+    : state === 'bag' ? bagBtns
+    : [];
+  if (mouse.click) {
+    var handled = false;
+    if (btnList.length) {
+      for (var i = 0; i < btnList.length; i++) {
+        var r = btnList[i].r;
+        if (mouse.x > r[0] && mouse.x < r[0] + r[2] && mouse.y > r[1] && mouse.y < r[1] + r[3]) { btnList[i].cb(); handled = true; break; }
+      }
+    }
+    if (!handled && state === 'play' && worldBtns.length) {
+      for (var wi = 0; wi < worldBtns.length; wi++) {
+        var wr = worldBtns[wi].r;
+        if (mouse.x > wr[0] && mouse.x < wr[0] + wr[2] && mouse.y > wr[1] && mouse.y < wr[1] + wr[3]) { worldBtns[wi].cb(); handled = true; break; }
+      }
+    }
+    if (handled) mouse.click = false;
+  }
+  // 右键点击：命中按钮的 rcb（仓库右键卖出 / 弹药区右键升级子弹 等）
+  if (mouse.rclick && btnList.length) {
+    for (var ri = 0; ri < btnList.length; ri++) {
+      var rr2 = btnList[ri].r;
+      if (mouse.x > rr2[0] && mouse.x < rr2[0] + rr2[2] && mouse.y > rr2[1] && mouse.y < rr2[1] + rr2[3]) {
+        if (btnList[ri].rcb) btnList[ri].rcb();
+        break;
+      }
+    }
+  }
+  if (state === 'home' && showHelp && mouse.click) { showHelp = false; mouse.click = false; }
+
+  just = {};
+  mouse.click = false;
+  mouse.rclick = false;
+  lastMouseDown = mouse.down;
+  requestAnimationFrame(frame);
+}
+
+/* ===================== 启动 ===================== */
+TH = Object.assign({}, BASE, LEVELS[0].theme);
+genWorld(0);
+player = newPlayer();
+stats = { kills: 0, deaths: 0, killStreak: 0, shots: 0 };
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
